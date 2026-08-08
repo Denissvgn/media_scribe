@@ -1,0 +1,6 @@
+{
+  "name": "Media Scribe",
+  "description": "A professional-grade media transcription & formatting tool supporting fully local offline execution (vLLM, Gemma, GPT-OSS, Ollama, Whisper) as well as Google Gemini Cloud models.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
