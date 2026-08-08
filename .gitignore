@@ -25,3 +25,6 @@ dist-ssr
 
 # Prompt history & migration artifacts
 migrated_prompt_history/
+
+# Local review artifacts
+PR1.png

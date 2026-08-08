@@ -336,7 +336,7 @@ async function callLocalLLM(
 
   if (!response.ok) {
     const detail = await readResponseDetail(response);
-    const issue = issueForHttpStatus(response, 'refinement', 'Language model', detail);
+    const issue = issueForHttpStatus(response.status, descriptor.inferenceUrl, 'refinement', 'Language model', detail);
     issue.target = 'llm';
     throw new TranscriptionWorkflowError(issue);
   }
@@ -410,31 +410,32 @@ const readResponseDetail = async (response: Response) => {
 };
 
 const issueForHttpStatus = (
-  response: Response,
+  status: number,
+  endpointUrlOrContext: string,
   stage: WorkflowStage,
   label: string,
   detail?: unknown
 ) => {
-  const endpoint = describeEndpoint(response.url || label);
-  if (response.status === 401 || response.status === 403) {
-    return buildWorkflowError(stage, 'AUTH_FAILED', `${label} rejected its credentials`, `Authentication failed at ${endpoint}.`, 'Review the API key in Expert settings.', 'settings', false, response.status, detail);
+  const endpoint = describeEndpoint(endpointUrlOrContext || label);
+  if (status === 401 || status === 403) {
+    return buildWorkflowError(stage, 'AUTH_FAILED', `${label} rejected its credentials`, `Authentication failed at ${endpoint}.`, 'Review the API key in Expert settings.', 'settings', false, status, detail);
   }
-  if (response.status === 404 || response.status === 405) {
-    return buildWorkflowError(stage, 'ENDPOINT_NOT_FOUND', `${label} route was not found`, `The configured server responded, but not at the expected API path.`, 'Check the base URL and engine type in Expert settings.', 'settings', false, response.status, detail);
+  if (status === 404 || status === 405) {
+    return buildWorkflowError(stage, 'ENDPOINT_NOT_FOUND', `${label} route was not found`, `The configured server responded, but not at the expected API path.`, 'Check the base URL and engine type in Expert settings.', 'settings', false, status, detail);
   }
-  if (response.status === 429) {
-    return buildWorkflowError(stage, 'RATE_LIMITED', `${label} is rate limited`, 'The service is temporarily limiting compatibility requests.', 'Wait briefly, then test the route again.', 'retry', true, response.status, detail);
+  if (status === 429) {
+    return buildWorkflowError(stage, 'RATE_LIMITED', `${label} is rate limited`, 'The service is temporarily limiting compatibility requests.', 'Wait briefly, then test the route again.', 'retry', true, status, detail);
   }
-  if (response.status === 413) {
-    return buildWorkflowError(stage, 'INVALID_FILE', 'Media file is too large', 'The endpoint rejected the request size.', 'Choose a smaller supported file, then try again.', 'file', false, response.status, detail);
+  if (status === 413) {
+    return buildWorkflowError(stage, 'INVALID_FILE', 'Media file is too large', 'The endpoint rejected the request size.', 'Choose a smaller supported file, then try again.', 'file', false, status, detail);
   }
-  if (response.status === 415 || response.status === 422) {
-    return buildWorkflowError(stage, 'INVALID_FILE', 'Media file was rejected', 'The endpoint could not process this file or request format.', 'Choose another supported media file or review the selected speech model.', 'file', false, response.status, detail);
+  if (status === 415 || status === 422) {
+    return buildWorkflowError(stage, 'INVALID_FILE', 'Media file was rejected', 'The endpoint could not process this file or request format.', 'Choose another supported media file or review the selected speech model.', 'file', false, status, detail);
   }
-  if (response.status >= 500) {
-    return buildWorkflowError(stage, 'SERVICE_UNAVAILABLE', `${label} is unavailable`, `The endpoint responded with status ${response.status}.`, 'Check the service logs, then retry.', 'retry', true, response.status, detail);
+  if (status >= 500) {
+    return buildWorkflowError(stage, 'SERVICE_UNAVAILABLE', `${label} is unavailable`, `The endpoint responded with status ${status}.`, 'Check the service logs, then retry.', 'retry', true, status, detail);
   }
-  return buildWorkflowError(stage, 'INCOMPATIBLE_RESPONSE', `${label} rejected the compatibility check`, `The endpoint responded with status ${response.status}.`, 'Review the endpoint and selected model in Expert settings.', 'settings', false, response.status, detail);
+  return buildWorkflowError(stage, 'INCOMPATIBLE_RESPONSE', `${label} rejected the compatibility check`, `The endpoint responded with status ${status}.`, 'Review the endpoint and selected model in Expert settings.', 'settings', false, status, detail);
 };
 
 const parseAdvertisedModels = (payload: any, protocol: EndpointProtocol) => {
@@ -533,7 +534,7 @@ const checkLlmCompatibility = async (config: LocalConfig, signal?: AbortSignal):
       inventoryWarning = 'This server does not expose model discovery; inference was tested directly.';
     } else {
       const detail = await readResponseDetail(inventory.response);
-      const error = issueForHttpStatus(inventory.response, 'preflight', 'Language model endpoint', detail);
+      const error = issueForHttpStatus(inventory.response.status, descriptor.modelsUrl, 'preflight', 'Language model endpoint', detail);
       return { target: 'llm', label: 'Language model', status: 'fail', detail: error.message, endpoint: describeEndpoint(descriptor.modelsUrl), model, error };
     }
   } catch (error) {
@@ -557,7 +558,7 @@ const checkLlmCompatibility = async (config: LocalConfig, signal?: AbortSignal):
     transport = probe.transport;
     if (!probe.response.ok) {
       const detail = await readResponseDetail(probe.response);
-      const error = issueForHttpStatus(probe.response, 'preflight', 'Language model inference', detail);
+      const error = issueForHttpStatus(probe.response.status, descriptor.inferenceUrl, 'preflight', 'Language model inference', detail);
       if (/model/i.test(String(detail)) && [400, 404, 422].includes(probe.response.status)) {
         error.code = 'MODEL_NOT_FOUND';
         error.title = `Model “${model}” could not run`;
@@ -668,7 +669,7 @@ const checkSttCompatibility = async (config: LocalConfig, signal?: AbortSignal):
       };
     }
     const detail = await readResponseDetail(inventory.response);
-    const error = issueForHttpStatus(inventory.response, 'preflight', 'Speech model endpoint', detail);
+    const error = issueForHttpStatus(inventory.response.status, descriptor.modelsUrl, 'preflight', 'Speech model endpoint', detail);
     return { target: 'stt', label: 'Speech recognition', status: 'fail', detail: error.message, endpoint: describeEndpoint(descriptor.modelsUrl), model, error };
   } catch (error) {
     if (isAbortError(error)) throw createAbortError();
@@ -792,6 +793,7 @@ async function callLocalSTT(
 ): Promise<string> {
   const descriptor = resolveSttEndpoint(config);
   const apiKey = config.sttApiKey || config.apiKey;
+  let attemptedUrl = descriptor.inferenceUrl;
   let result: XhrResult;
   console.log(`Sending audio to STT engine at ${descriptor.inferenceUrl} (model: ${config.sttModel})...`);
   try {
@@ -803,6 +805,7 @@ async function callLocalSTT(
 
   if ([404, 405].includes(result.status) && descriptor.inferenceUrl.includes('/v1/')) {
     const fallbackUrl = descriptor.inferenceUrl.replace('/v1/', '/');
+    attemptedUrl = fallbackUrl;
     try {
       result = await sendXhr(fallbackUrl, createSttFormData(file, config), apiKey, onProgress, signal);
     } catch (error) {
@@ -812,9 +815,9 @@ async function callLocalSTT(
   }
 
   if (result.status < 200 || result.status >= 300) {
-    const response = new Response(result.responseText, { status: result.status || 502 });
+    const status = result.status || 502;
     const detail = safeTechnicalDetail(result.responseText);
-    const issue = issueForHttpStatus(response, 'transcription', 'Speech transcription endpoint', detail);
+    const issue = issueForHttpStatus(status, attemptedUrl, 'transcription', 'Speech transcription endpoint', detail);
     issue.target = 'stt';
     try {
       const payload = JSON.parse(result.responseText);
@@ -1025,8 +1028,7 @@ const issueFromAppResponse = (
 ) => {
   let payload: any = {};
   try { payload = JSON.parse(responseText); } catch {}
-  const response = new Response(responseText, { status: status || 502 });
-  const issue = issueForHttpStatus(response, stage, 'Transcription server', payload.detail || responseText);
+  const issue = issueForHttpStatus(status || 502, 'Transcription server', stage, 'Transcription server', payload.detail || responseText);
   if (typeof payload.error === 'string') issue.message = payload.error;
   if (typeof payload.suggestion === 'string') issue.suggestion = payload.suggestion;
   if (payload.action === 'retry' || payload.action === 'restart_upload') issue.recovery = 'retry';

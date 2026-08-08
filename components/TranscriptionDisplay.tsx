@@ -1,7 +1,7 @@
 import React, { useEffect, useId, useRef, useState } from 'react';
 import { Button } from './Button';
 import { SignalToTextMark } from './SignalToTextMark';
-import { ModelProvider, TranscriptionCompletionMetadata } from '../types';
+import { TranscriptionCompletionMetadata } from '../types';
 
 type ExportFormat = 'txt' | 'md' | 'json';
 
@@ -21,6 +21,40 @@ interface TranscriptionDisplayProps {
 const getDefaultTitle = (fileName: string) => {
   const withoutExtension = fileName.replace(/\.[^/.]+$/, '').trim();
   return withoutExtension || fileName || 'Untitled transcript';
+};
+
+interface TranscriptDiscardStateInput {
+  text: string;
+  originalText: string;
+  title: string;
+  notes: string;
+  defaultTitle: string;
+}
+
+export const getTranscriptDiscardState = ({
+  text,
+  originalText,
+  title,
+  notes,
+  defaultTitle
+}: TranscriptDiscardStateInput) => {
+  const normalizedDefaultTitle = defaultTitle.trim() || 'Untitled transcript';
+  const resolvedTitle = title.trim() || normalizedDefaultTitle;
+  const normalizedNotes = notes.trim();
+  const hasGeneratedTranscript = originalText.trim().length > 0;
+  const transcriptChanged = text !== originalText;
+  const titleChanged = resolvedTitle !== normalizedDefaultTitle;
+  const hasNotes = normalizedNotes.length > 0;
+
+  return {
+    resolvedTitle,
+    normalizedNotes,
+    hasGeneratedTranscript,
+    transcriptChanged,
+    titleChanged,
+    hasNotes,
+    shouldConfirmDiscard: hasGeneratedTranscript || transcriptChanged || titleChanged || hasNotes
+  };
 };
 
 const formatBytes = (bytes: number) => {
@@ -75,10 +109,20 @@ export const TranscriptionDisplay: React.FC<TranscriptionDisplayProps> = ({
   const idPrefix = useId();
 
   const defaultTitle = getDefaultTitle(metadata.source.fileName);
-  const displayTitle = title.trim() || defaultTitle;
+  const discardState = getTranscriptDiscardState({
+    text,
+    originalText,
+    title,
+    notes,
+    defaultTitle
+  });
+  const {
+    resolvedTitle: displayTitle,
+    normalizedNotes,
+    transcriptChanged,
+    shouldConfirmDiscard
+  } = discardState;
   const hasDraft = text.trim().length > 0;
-  const transcriptChanged = text !== originalText;
-  const hasWorkingChanges = transcriptChanged || title !== defaultTitle || notes !== '';
   const modelPath = metadata.processing.stt
     ? `${metadata.processing.stt.engine} / ${metadata.processing.stt.model} → ${metadata.processing.llm.engine} / ${metadata.processing.llm.model}`
     : `${metadata.processing.llm.engine} / ${metadata.processing.llm.model}`;
@@ -123,7 +167,7 @@ export const TranscriptionDisplay: React.FC<TranscriptionDisplayProps> = ({
     }
 
     if (exportFormat === 'md') {
-      const noteContent = notes.trim() || '_No notes added._';
+      const noteContent = normalizedNotes || '_No notes added._';
       const sourceName = cleanMarkdownValue(metadata.source.fileName);
       const mimeType = cleanMarkdownValue(metadata.source.mimeType);
       const route = cleanMarkdownValue(metadata.processing.routeTitle);
@@ -131,7 +175,7 @@ export const TranscriptionDisplay: React.FC<TranscriptionDisplayProps> = ({
 
       return {
         content: [
-          `# ${title.trim() || defaultTitle}`,
+          `# ${displayTitle}`,
           '',
           '## Details',
           '',
@@ -162,8 +206,8 @@ export const TranscriptionDisplay: React.FC<TranscriptionDisplayProps> = ({
       content: JSON.stringify({
         artifactType: 'media-scribe-transcript',
         schemaVersion: 1,
-        title: title.trim() || defaultTitle,
-        notes,
+        title: displayTitle,
+        notes: normalizedNotes,
         source: {
           ...metadata.source,
           lastModifiedAt: new Date(metadata.source.lastModified).toISOString()
@@ -193,7 +237,7 @@ export const TranscriptionDisplay: React.FC<TranscriptionDisplayProps> = ({
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement('a');
       anchor.href = url;
-      anchor.download = `${sanitizeDownloadName(title, metadata.source.fileName)}.${artifact.extension}`;
+      anchor.download = `${sanitizeDownloadName(displayTitle, metadata.source.fileName)}.${artifact.extension}`;
       document.body.appendChild(anchor);
       anchor.click();
       anchor.remove();
@@ -211,7 +255,7 @@ export const TranscriptionDisplay: React.FC<TranscriptionDisplayProps> = ({
   };
 
   const handleTranscribeAnother = () => {
-    if (hasDraft || hasWorkingChanges) {
+    if (shouldConfirmDiscard) {
       setConfirmDiscard(true);
       return;
     }

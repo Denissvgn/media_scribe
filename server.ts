@@ -7,6 +7,11 @@ import fs from "fs";
 import { fetch as undiciFetch, Agent } from "undici";
 import { GEMINI_MODEL, MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_MIB } from "./constants";
 import { validateMediaFile, type MediaValidationResult } from "./mediaValidation";
+import {
+  isBlockedRelayDestination,
+  isRelayRedirectStatus,
+  parseRelayTarget
+} from "./relaySecurity";
 
 // Configure a custom fetch handler for Node standard fetch.
 // This resolves undici and Node internal fetch class-mismatch bugs (e.g. invalid content-length: NaN)
@@ -1105,29 +1110,19 @@ app.post("/api/transcribe-chunked", async (req, res) => {
   }
 });
 
-function resolveSttTranscriptionUrl(value: unknown): URL | null {
-  if (typeof value !== "string" || value.length === 0 || value.length > 2048) return null;
-
-  try {
-    const url = new URL(value);
-    if ((url.protocol !== "http:" && url.protocol !== "https:") || url.username || url.password) {
-      return null;
-    }
-
-    const pathname = url.pathname.replace(/\/+$/, "");
-    if (pathname.endsWith("/audio/transcriptions")) {
-      url.pathname = pathname;
-    } else if (pathname.endsWith("/v1")) {
-      url.pathname = `${pathname}/audio/transcriptions`;
-    } else {
-      url.pathname = `${pathname}/v1/audio/transcriptions`;
-    }
-    url.search = "";
-    url.hash = "";
-    return url;
-  } catch (_) {
-    return null;
+function resolveSttTranscriptionUrl(target: URL): URL {
+  const url = new URL(target);
+  const pathname = url.pathname.replace(/\/+$/, "");
+  if (pathname.endsWith("/audio/transcriptions")) {
+    url.pathname = pathname;
+  } else if (pathname.endsWith("/v1")) {
+    url.pathname = `${pathname}/audio/transcriptions`;
+  } else {
+    url.pathname = `${pathname}/v1/audio/transcriptions`;
   }
+  url.search = "";
+  url.hash = "";
+  return url;
 }
 
 function isSafeShortField(value: unknown, maximumLength: number): value is string {
@@ -1144,7 +1139,8 @@ app.post(
   handleSingleUpload(mediaUpload.single("file"), "local_stt"),
   async (req, res) => {
     const file = req.file;
-    const targetUrl = resolveSttTranscriptionUrl(req.body?.targetUrl);
+    const parsedTarget = parseRelayTarget(req.body?.targetUrl);
+    const targetUrl = parsedTarget ? resolveSttTranscriptionUrl(parsedTarget) : null;
     const model = req.body?.model;
     const language = req.body?.language;
     const apiKey = req.body?.apiKey;
@@ -1179,6 +1175,18 @@ app.post(
         retryable: false,
         action: "review_settings",
         suggestion: "Enter an http(s) STT endpoint and a model identifier, then test the route again."
+      });
+    }
+
+    if (isBlockedRelayDestination(targetUrl)) {
+      removeTempFile(file.path);
+      return sendApiError(res, 400, {
+        error: "The local speech endpoint is not an allowed relay target.",
+        code: "PROXY_TARGET_NOT_ALLOWED",
+        stage: "local_stt",
+        retryable: false,
+        action: "review_settings",
+        suggestion: "Use a localhost, private-network, or public speech endpoint that is not a link-local metadata address."
       });
     }
 
@@ -1236,8 +1244,20 @@ app.post(
         method: "POST",
         headers,
         body: formData,
-        signal: controller.signal
+        signal: controller.signal,
+        redirect: "manual"
       });
+      if (isRelayRedirectStatus(upstream.status)) {
+        await upstream.body?.cancel().catch(() => undefined);
+        return sendApiError(res, 400, {
+          error: "The local speech endpoint redirected the transcription request.",
+          code: "UPSTREAM_REDIRECT_NOT_ALLOWED",
+          stage: "local_stt",
+          retryable: false,
+          action: "review_settings",
+          suggestion: "Enter the final speech endpoint URL directly, then test the route again."
+        });
+      }
       const responseText = await upstream.text();
       const contentType = upstream.headers.get("content-type") || "";
 
@@ -1287,28 +1307,10 @@ app.post(
 app.post("/api/local-proxy", express.json({ limit: "50mb" }), async (req, res) => {
   const { targetUrl, method = "POST", headers = {}, body } = req.body;
 
-  let target: URL;
-  try {
-    target = new URL(targetUrl);
-  } catch (_) {
+  const target = parseRelayTarget(targetUrl);
+  if (!target) {
     return sendApiError(res, 400, {
-      error: "The configured endpoint URL is invalid.",
-      code: "INVALID_PROXY_TARGET",
-      stage: "preflight",
-      retryable: false,
-      action: "review_settings",
-      suggestion: "Enter a complete http(s) endpoint in Expert settings."
-    });
-  }
-
-  if (typeof targetUrl !== "string"
-    || targetUrl.length > 2048
-    || (target.protocol !== "http:" && target.protocol !== "https:")
-    || target.username
-    || target.password
-  ) {
-    return sendApiError(res, 400, {
-      error: "The configured endpoint URL is not supported.",
+      error: "The configured endpoint URL is invalid or unsupported.",
       code: "INVALID_PROXY_TARGET",
       stage: "preflight",
       retryable: false,
@@ -1319,15 +1321,8 @@ app.post("/api/local-proxy", express.json({ limit: "50mb" }), async (req, res) =
 
   const proxyPath = target.pathname.replace(/\/+$/, "");
   const allowedProxyPaths = ["/models", "/chat/completions", "/api/tags", "/api/generate"];
-  const blockedProxyHosts = new Set([
-    "169.254.169.254",
-    "169.254.170.2",
-    "100.100.100.200",
-    "metadata.google.internal"
-  ]);
   if (!allowedProxyPaths.some(suffix => proxyPath.endsWith(suffix))
-    || blockedProxyHosts.has(target.hostname.toLowerCase())
-    || target.hostname.toLowerCase().startsWith("fe80:")
+    || isBlockedRelayDestination(target)
   ) {
     return sendApiError(res, 400, {
       error: "The relay target is outside the supported model API surface.",
@@ -1375,7 +1370,8 @@ app.post("/api/local-proxy", express.json({ limit: "50mb" }), async (req, res) =
     const options: RequestInit = {
       method: normalizedMethod,
       headers: safeHeaders,
-      signal: controller.signal
+      signal: controller.signal,
+      redirect: "manual"
     };
 
     if (body) {
@@ -1383,6 +1379,17 @@ app.post("/api/local-proxy", express.json({ limit: "50mb" }), async (req, res) =
     }
 
     const response = await fetch(target, options);
+    if (isRelayRedirectStatus(response.status)) {
+      await response.body?.cancel().catch(() => undefined);
+      return sendApiError(res, 400, {
+        error: "The configured processing endpoint redirected the relay request.",
+        code: "UPSTREAM_REDIRECT_NOT_ALLOWED",
+        stage: "preflight",
+        retryable: false,
+        action: "review_settings",
+        suggestion: "Enter the final models or inference endpoint URL directly, then test the route again."
+      });
+    }
     const contentType = response.headers.get("content-type") || "";
     
     if (contentType.includes("application/json")) {
