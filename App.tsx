@@ -1,23 +1,136 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { FileUploader } from './components/FileUploader';
+import { SpeechHints } from './components/SpeechHints';
 import { TranscriptionDisplay } from './components/TranscriptionDisplay';
-import { AppStatus, ModelProvider, TranscriptionMode, LocalConfig, LocalEngineType, STTEngineType } from './types';
-import { transcribeAudio, fetchLocalModels, fetchLocalSTTModels } from './services/geminiService';
+import { SignalToTextMark } from './components/SignalToTextMark';
+import {
+  ActionableWorkflowError,
+  AppStatus,
+  CompatibilityReport,
+  LocalConfig,
+  LocalEngineType,
+  ModelProvider,
+  STTEngineType,
+  TranscriptionCompletionMetadata,
+  TranscriptionMode
+} from './types';
+import {
+  fetchLocalModels,
+  fetchLocalSTTModels,
+  isAbortError,
+  normalizeTranscriptionError,
+  preflightTranscriptionRoute,
+  transcribeAudio
+} from './services/geminiService';
 import { Button } from './components/Button';
+import {
+  ExpertSettings,
+  ExpertSectionId,
+  RouteOutcome
+} from './components/ExpertSettings';
+import { validateMediaFile } from './mediaValidation';
+import { GEMINI_MODEL } from './constants';
+
+const getDefaultTranscriptTitle = (fileName: string) => {
+  const withoutExtension = fileName.replace(/\.[^/.]+$/, '').trim();
+  return withoutExtension || fileName || 'Untitled transcript';
+};
+
+const formatFileSize = (sizeBytes: number) => {
+  if (sizeBytes < 1024) return `${sizeBytes} ${sizeBytes === 1 ? 'byte' : 'bytes'}`;
+  if (sizeBytes < 1024 * 1024) return `${(sizeBytes / 1024).toFixed(1)} KiB`;
+  return `${(sizeBytes / (1024 * 1024)).toFixed(1)} MiB`;
+};
+
+const scopedRouteFingerprint = (fingerprint: string, refinementOnly: boolean) => (
+  `${fingerprint}::${refinementOnly ? 'refinement' : 'full-route'}`
+);
+
+interface WorkflowStageHeaderProps {
+  number: number;
+  id: string;
+  title: string;
+  description: string;
+  focusable?: boolean;
+  state?: 'current' | 'complete' | 'upcoming';
+}
+
+const WorkflowStageHeader: React.FC<WorkflowStageHeaderProps> = ({
+  number,
+  id,
+  title,
+  description,
+  focusable = false,
+  state = 'upcoming'
+}) => {
+  const markerStyles = state === 'complete'
+    ? 'border-emerald-400/40 bg-emerald-500/10 text-emerald-200'
+    : state === 'current'
+      ? 'border-indigo-400/50 bg-indigo-500/15 text-indigo-100'
+      : 'border-slate-700 bg-slate-900 text-slate-400';
+
+  return (
+  <header className="mb-4 flex items-start gap-3" aria-current={state === 'current' ? 'step' : undefined}>
+    <span
+      className={`relative flex h-9 w-9 shrink-0 items-center justify-center rounded-full border font-mono text-sm font-medium tabular-nums ${markerStyles}`}
+      aria-hidden="true"
+    >
+      {number}
+      {state === 'complete' && (
+        <span className="absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full border-2 border-slate-950 bg-emerald-300" />
+      )}
+    </span>
+    <div className="min-w-0 pt-0.5">
+      <h2
+        id={id}
+        tabIndex={focusable ? -1 : undefined}
+        className="rounded font-editorial text-2xl font-semibold leading-tight tracking-[-0.02em] text-slate-50 [overflow-wrap:anywhere] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-300 focus-visible:ring-offset-4 focus-visible:ring-offset-slate-950"
+      >
+        {title}
+        <span className="sr-only">
+          {state === 'complete' ? ' — complete' : state === 'current' ? ' — current step' : ' — upcoming'}
+        </span>
+      </h2>
+      <p className="mt-1 max-w-[65ch] text-base leading-6 text-slate-400">{description}</p>
+    </div>
+  </header>
+  );
+};
 
 const App: React.FC = () => {
   const [status, setStatus] = useState<AppStatus>(AppStatus.IDLE);
   const [file, setFile] = useState<File | null>(null);
   const [transcription, setTranscription] = useState<string>('');
-  const [error, setError] = useState<string | null>(null);
+  const [generatedTranscription, setGeneratedTranscription] = useState<string>('');
+  const [transcriptTitle, setTranscriptTitle] = useState<string>('');
+  const [transcriptNotes, setTranscriptNotes] = useState<string>('');
+  const [completionMetadata, setCompletionMetadata] = useState<TranscriptionCompletionMetadata | null>(null);
+  const [error, setError] = useState<ActionableWorkflowError | null>(null);
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [processingStatus, setProcessingStatus] = useState<string>('');
+  const [routeCheck, setRouteCheck] = useState<{ status: 'idle' | 'checking' | 'complete'; report: CompatibilityReport | null }>({ status: 'idle', report: null });
+  const [routeCheckFingerprint, setRouteCheckFingerprint] = useState('');
+  const [partialTranscription, setPartialTranscription] = useState('');
+  const [partialMetadata, setPartialMetadata] = useState<TranscriptionCompletionMetadata | null>(null);
+  const [liveAnnouncement, setLiveAnnouncement] = useState({ id: 0, message: '' });
+  const requestVersionRef = useRef(0);
+  const activeRequestControllerRef = useRef<AbortController | null>(null);
+  const routeCheckControllerRef = useRef<AbortController | null>(null);
+  const processingRegionRef = useRef<HTMLDivElement | null>(null);
+  const errorRegionRef = useRef<HTMLDivElement | null>(null);
+  const termsInputRef = useRef<HTMLInputElement | null>(null);
+  const pendingSettingsFocusRef = useRef<string | null>(null);
 
   const [termsText, setTermsText] = useState<string>('');
   const [termsList, setTermsList] = useState<string[]>([]);
   const [termsFileName, setTermsFileName] = useState<string | null>(null);
   const [isDraggingTerms, setIsDraggingTerms] = useState(false);
+  const [termsError, setTermsError] = useState<string | null>(null);
+
+  const announceStatus = (message: string) => {
+    setLiveAnnouncement(current => ({ id: current.id + 1, message }));
+  };
 
   const parseAndSetTerms = (text: string) => {
     const lines = text
@@ -26,55 +139,61 @@ const App: React.FC = () => {
       .filter(line => line.length > 0);
     setTermsList(lines);
     setTermsText(text);
+    return lines.length;
   };
 
-  const handleTermsFileDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDraggingTerms(false);
-    const selectedFile = e.dataTransfer.files?.[0];
-    if (!selectedFile) return;
-
+  const loadTermsFile = (selectedFile: File) => {
     if (!selectedFile.name.toLowerCase().endsWith('.txt') && selectedFile.type !== 'text/plain') {
-      alert('Please upload a plain text file (.txt) containing terms.');
+      setTermsError('Choose a plain-text speech-hints file (.txt), then try again.');
       return;
     }
 
     const reader = new FileReader();
     reader.onload = (event) => {
-      const text = event.target?.result as string;
-      parseAndSetTerms(text);
+      const result = event.target?.result;
+      if (typeof result !== 'string') {
+        setTermsError('The speech-hints file could not be read as text. Choose another file.');
+        return;
+      }
+
+      const termCount = parseAndSetTerms(result);
       setTermsFileName(selectedFile.name);
+      setTermsError(null);
+      announceStatus(`Loaded ${termCount} speech ${termCount === 1 ? 'hint' : 'hints'} from ${selectedFile.name}.`);
+    };
+    reader.onerror = () => {
+      setTermsError('The speech-hints file could not be read. Choose another file and try again.');
     };
     reader.readAsText(selectedFile);
+  };
+
+  const handleTermsFileDrop = (e: React.DragEvent<HTMLButtonElement>) => {
+    e.preventDefault();
+    setIsDraggingTerms(false);
+    const selectedFile = e.dataTransfer.files?.[0];
+    if (selectedFile) loadTermsFile(selectedFile);
   };
 
   const handleTermsFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0];
-    if (!selectedFile) return;
-
-    if (!selectedFile.name.toLowerCase().endsWith('.txt') && selectedFile.type !== 'text/plain') {
-      alert('Please upload a plain text file (.txt) containing terms.');
-      return;
-    }
-
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const text = event.target?.result as string;
-      parseAndSetTerms(text);
-      setTermsFileName(selectedFile.name);
-    };
-    reader.readAsText(selectedFile);
+    if (selectedFile) loadTermsFile(selectedFile);
+    e.target.value = '';
   };
 
   const handleTermsTextChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const value = e.target.value;
     parseAndSetTerms(value);
+    setTermsFileName(null);
+    setTermsError(null);
   };
 
   const handleClearTerms = () => {
+    const hadTerms = termsList.length > 0;
     setTermsText('');
     setTermsList([]);
     setTermsFileName(null);
+    setTermsError(null);
+    if (hadTerms) announceStatus('Speech hints cleared.');
   };
 
   const [provider, setProvider] = useState<ModelProvider>(() => {
@@ -123,18 +242,31 @@ const App: React.FC = () => {
   const [fetchedSTTModels, setFetchedSTTModels] = useState<string[] | null>(null);
   const [fetchSTTModelsStatus, setFetchSTTModelsStatus] = useState<string | null>(null);
 
+  const compatibilityFingerprint = JSON.stringify({
+    provider,
+    baseUrl: localConfig.baseUrl.trim(),
+    llmModel: localConfig.llmModel.trim(),
+    transcriptionMode: localConfig.transcriptionMode,
+    sttUrl: localConfig.sttUrl.trim(),
+    sttModel: localConfig.sttModel.trim(),
+    engineType: localConfig.engineType,
+    sttEngine: localConfig.sttEngine,
+    apiKey: localConfig.apiKey?.trim(),
+    sttApiKey: localConfig.sttApiKey?.trim()
+  });
+
   const handleFetchModels = async () => {
     setIsFetchingModels(true);
-    setFetchModelsStatus("Querying server endpoint for active loaded models...");
+    setFetchModelsStatus('Checking the language-model endpoint…');
     setFetchedModels(null);
     try {
       const models = await fetchLocalModels(localConfig.baseUrl, localConfig.apiKey);
       if (models && models.length > 0) {
         setFetchedModels(models);
-        setFetchModelsStatus(`Successfully discovered ${models.length} loaded LLM model(s)!`);
+        setFetchModelsStatus(`Discovered ${models.length} language ${models.length === 1 ? 'model' : 'models'}.`);
       } else {
         setFetchedModels([]);
-        setFetchModelsStatus("No models returned. Verify server status and CORS configuration.");
+        setFetchModelsStatus('No language models were returned. Verify the endpoint and browser-access settings.');
       }
     } catch (err: any) {
       setFetchModelsStatus(`Discovery failed: ${err.message || 'Network error'}`);
@@ -145,16 +277,16 @@ const App: React.FC = () => {
 
   const handleFetchSTTModels = async () => {
     setIsFetchingSTTModels(true);
-    setFetchSTTModelsStatus("Querying STT server for active speech recognition models...");
+    setFetchSTTModelsStatus('Checking the speech endpoint…');
     setFetchedSTTModels(null);
     try {
       const models = await fetchLocalSTTModels(localConfig.sttUrl, localConfig.sttApiKey || localConfig.apiKey);
       if (models && models.length > 0) {
         setFetchedSTTModels(models);
-        setFetchSTTModelsStatus(`Successfully discovered ${models.length} active STT model(s)!`);
+        setFetchSTTModelsStatus(`Discovered ${models.length} speech ${models.length === 1 ? 'model' : 'models'}.`);
       } else {
         setFetchedSTTModels([]);
-        setFetchSTTModelsStatus("No STT models returned. Check local STT server logs.");
+        setFetchSTTModelsStatus('No speech models were returned. Check the configured endpoint logs.');
       }
     } catch (err: any) {
       setFetchSTTModelsStatus(`Discovery failed: ${err.message || 'Network error'}`);
@@ -209,7 +341,28 @@ const App: React.FC = () => {
     setFetchSTTModelsStatus(null);
   };
 
-  const [showSettings, setShowSettings] = useState(true);
+  const handleRouteOutcomeChange = (outcome: RouteOutcome) => {
+    setOpenExpertSection(null);
+    if (outcome === 'gemini') {
+      setProvider(ModelProvider.GEMINI);
+      announceStatus('Processing route changed to Google Gemini cloud.');
+      return;
+    }
+
+    setProvider(ModelProvider.LOCAL);
+    setLocalConfig(current => ({
+      ...current,
+      transcriptionMode: outcome === 'hybrid'
+        ? TranscriptionMode.HYBRID
+        : TranscriptionMode.LOCAL_STT
+    }));
+    announceStatus(outcome === 'hybrid'
+      ? 'Processing route changed to Gemini speech with your language model.'
+      : 'Processing route changed to your configured speech and language-model endpoints.');
+  };
+
+  const [showSettings, setShowSettings] = useState(false);
+  const [openExpertSection, setOpenExpertSection] = useState<ExpertSectionId | null>(null);
 
   // Sync settings to localStorage
   useEffect(() => {
@@ -219,6 +372,34 @@ const App: React.FC = () => {
   useEffect(() => {
     localStorage.setItem('local_config', JSON.stringify(localConfig));
   }, [localConfig]);
+
+  const focusSettingsTarget = (targetId: string) => {
+    window.requestAnimationFrame(() => {
+      const target = document.getElementById(targetId)
+        || document.getElementById('expert-processing-settings');
+      target?.focus();
+    });
+  };
+
+  useEffect(() => {
+    if (!showSettings || !openExpertSection || !pendingSettingsFocusRef.current) return;
+    const targetId = pendingSettingsFocusRef.current;
+    pendingSettingsFocusRef.current = null;
+    focusSettingsTarget(targetId);
+  }, [showSettings, openExpertSection]);
+
+  useEffect(() => {
+    routeCheckControllerRef.current?.abort();
+    routeCheckControllerRef.current = null;
+    setRouteCheck({ status: 'idle', report: null });
+    setRouteCheckFingerprint('');
+  }, [compatibilityFingerprint]);
+
+  useEffect(() => () => {
+    requestVersionRef.current += 1;
+    activeRequestControllerRef.current?.abort();
+    routeCheckControllerRef.current?.abort();
+  }, []);
 
   // Clean up object URL when file changes or unmounts
   useEffect(() => {
@@ -231,862 +412,901 @@ const App: React.FC = () => {
     }
   }, [file]);
 
+  useEffect(() => {
+    if (error) errorRegionRef.current?.focus();
+  }, [error]);
+
+  useEffect(() => {
+    if (status === AppStatus.CANCELLED) document.getElementById('retry-canceled-button')?.focus();
+  }, [status]);
+
   const handleFileSelect = (selectedFile: File) => {
+    const validation = validateMediaFile(selectedFile);
+    if (validation.valid === false) {
+      setError({
+        code: 'INVALID_FILE',
+        stage: 'validation',
+        title: 'This media file cannot be used',
+        message: validation.message,
+        suggestion: 'Choose another supported media file. Your route settings and speech hints are unchanged.',
+        retryable: false,
+        recovery: 'file'
+      });
+      setStatus(AppStatus.ERROR);
+      return;
+    }
+
+    requestVersionRef.current += 1;
+    activeRequestControllerRef.current?.abort();
+    activeRequestControllerRef.current = null;
     setFile(selectedFile);
     setStatus(AppStatus.IDLE);
     setTranscription('');
+    setGeneratedTranscription('');
+    setTranscriptTitle('');
+    setTranscriptNotes('');
+    setCompletionMetadata(null);
+    setPartialTranscription('');
+    setPartialMetadata(null);
     setError(null);
+    setUploadProgress(null);
+    setProcessingStatus('');
+    announceStatus(`Selected ${selectedFile.name}. Review the route and speech hints, then start transcription.`);
+    window.requestAnimationFrame(() => document.getElementById('preparation-stage-title')?.focus());
   };
 
-  const handleTranscribe = async () => {
-    if (!file) return;
+  const performRouteCheck = async (
+    providerSnapshot: ModelProvider,
+    configSnapshot: LocalConfig,
+    fingerprint: string,
+    signal: AbortSignal,
+    resumeFromTranscription = false
+  ) => {
+    setRouteCheck({ status: 'checking', report: null });
+    const report = await preflightTranscriptionRoute(providerSnapshot, configSnapshot, signal, resumeFromTranscription);
+    if (!signal.aborted) {
+      setRouteCheck({ status: 'complete', report });
+      setRouteCheckFingerprint(fingerprint);
+    }
+    return report;
+  };
 
-    setStatus(AppStatus.PROCESSING);
-    setUploadProgress(0);
-    setProcessingStatus('Starting server transmission...');
-    setError(null);
-
+  const handleCheckRoute = async () => {
+    if (status === AppStatus.PROCESSING) return;
+    routeCheckControllerRef.current?.abort();
+    const controller = new AbortController();
+    routeCheckControllerRef.current = controller;
+    const fingerprint = scopedRouteFingerprint(compatibilityFingerprint, false);
     try {
-      const result = await transcribeAudio(
-        file, 
-        (percent) => {
-          setUploadProgress(percent);
-          if (percent === 100) {
-            setProcessingStatus('Transmission complete! Processing transcription on the model backend...');
-          } else {
-            setProcessingStatus(`Uploading file: ${percent}%`);
-          }
-        },
-        provider,
-        localConfig,
-        (statusMessage) => {
-          setProcessingStatus(statusMessage);
-        },
-        termsList
-      );
-      setTranscription(result);
-      setStatus(AppStatus.COMPLETED);
-    } catch (err: any) {
-      setError(err.message || "An unexpected error occurred during transcription.");
-      setStatus(AppStatus.ERROR);
+      const report = await performRouteCheck(provider, { ...localConfig }, fingerprint, controller.signal);
+      if (routeCheckControllerRef.current !== controller || controller.signal.aborted) return;
+      window.requestAnimationFrame(() => document.getElementById('processing-route-status')?.focus());
+    } catch (checkError) {
+      if (isAbortError(checkError)) return;
+      const issue = normalizeTranscriptionError(checkError, 'preflight');
+      const report: CompatibilityReport = {
+        status: 'blocked',
+        summary: 'Route needs attention before transcription.',
+        checkedAt: new Date().toISOString(),
+        checks: [{ target: 'llm', label: 'Processing route', status: 'fail', detail: issue.message, error: issue }]
+      };
+      setRouteCheck({ status: 'complete', report });
+      setRouteCheckFingerprint(fingerprint);
+      window.requestAnimationFrame(() => document.getElementById('processing-route-status')?.focus());
     } finally {
-      setUploadProgress(null);
-      setProcessingStatus('');
+      if (routeCheckControllerRef.current === controller) routeCheckControllerRef.current = null;
     }
   };
 
-  const handleReset = () => {
-    setFile(null);
-    setTranscription('');
-    setStatus(AppStatus.IDLE);
+  const handleTranscribe = async (restartFullPipeline = false) => {
+    if (!file || status === AppStatus.PROCESSING) return;
+
+    const validation = validateMediaFile(file);
+    if (validation.valid === false) {
+      setError({
+        code: 'INVALID_FILE',
+        stage: 'validation',
+        title: 'This media file cannot be transcribed',
+        message: validation.message,
+        suggestion: 'Choose another supported media file. Your settings and speech hints will remain available.',
+        retryable: false,
+        recovery: 'file'
+      });
+      setStatus(AppStatus.ERROR);
+      return;
+    }
+
+    const requestVersion = requestVersionRef.current + 1;
+    requestVersionRef.current = requestVersion;
+    activeRequestControllerRef.current?.abort();
+    routeCheckControllerRef.current?.abort();
+    const controller = new AbortController();
+    activeRequestControllerRef.current = controller;
+    const selectedFile = file;
+    const providerSnapshot = provider;
+    const configSnapshot = { ...localConfig };
+    const termsSnapshot = [...termsList];
+    const processingSnapshot: TranscriptionCompletionMetadata['processing'] = {
+      provider: providerSnapshot,
+      mode: providerSnapshot === ModelProvider.GEMINI
+        ? ModelProvider.GEMINI
+        : configSnapshot.transcriptionMode,
+      routeTitle: processingRoute.title,
+      routeDetail: processingRoute.detail,
+      routeBadge: processingRoute.badge,
+      llm: providerSnapshot === ModelProvider.GEMINI
+        ? { engine: 'Google Gemini', model: GEMINI_MODEL }
+        : { engine: selectedEngineName, model: configSnapshot.llmModel },
+      stt: providerSnapshot === ModelProvider.GEMINI
+        ? null
+        : configSnapshot.transcriptionMode === TranscriptionMode.HYBRID
+          ? { engine: 'Google Gemini', model: GEMINI_MODEL }
+          : { engine: selectedSTTEngineName, model: configSnapshot.sttModel },
+      configuredLanguage: providerSnapshot === ModelProvider.LOCAL
+        && configSnapshot.transcriptionMode === TranscriptionMode.LOCAL_STT
+        ? configSnapshot.sttLanguage || 'auto'
+        : 'auto'
+    };
+    const attemptMetadata: TranscriptionCompletionMetadata = {
+      source: {
+        fileName: selectedFile.name,
+        mimeType: selectedFile.type || 'application/octet-stream',
+        sizeBytes: selectedFile.size,
+        lastModified: selectedFile.lastModified
+      },
+      completedAt: new Date().toISOString(),
+      processing: processingSnapshot,
+      termsCount: termsSnapshot.length
+    };
+
+    setStatus(AppStatus.PROCESSING);
+    setUploadProgress(null);
+    setProcessingStatus('Testing the processing route…');
     setError(null);
+    window.requestAnimationFrame(() => processingRegionRef.current?.focus());
+
+    try {
+      const resumeFromRecoveredTranscript = Boolean(partialTranscription && !restartFullPipeline);
+      const desiredRouteFingerprint = scopedRouteFingerprint(
+        compatibilityFingerprint,
+        resumeFromRecoveredTranscript
+      );
+      const cachedCheckIsFresh = routeCheckFingerprint === desiredRouteFingerprint
+        && routeCheck.report
+        && Date.now() - new Date(routeCheck.report.checkedAt).getTime() < 30_000;
+      const compatibility = cachedCheckIsFresh
+        ? routeCheck.report!
+        : await performRouteCheck(
+            providerSnapshot,
+            configSnapshot,
+            desiredRouteFingerprint,
+            controller.signal,
+            resumeFromRecoveredTranscript
+          );
+
+      if (requestVersionRef.current !== requestVersion || controller.signal.aborted) return;
+      if (compatibility.status === 'blocked') {
+        const firstFailure = compatibility.checks.find(check => check.status === 'fail');
+        setError(firstFailure?.error ? { ...firstFailure.error, target: firstFailure.target } : {
+          code: 'INCOMPATIBLE_RESPONSE',
+          stage: 'preflight',
+          title: 'Processing route needs attention',
+          message: firstFailure?.detail || compatibility.summary,
+          suggestion: 'Open expert settings, test the route, then retry.',
+          retryable: false,
+          recovery: 'settings'
+        });
+        setStatus(AppStatus.ERROR);
+        return;
+      }
+
+      setProcessingStatus(compatibility.status === 'warning'
+        ? 'Route reached. Verifying speech compatibility with this media file…'
+        : 'Route ready. Preparing the media file…');
+
+      const result = await transcribeAudio({
+        file: selectedFile,
+        provider: providerSnapshot,
+        localConfig: configSnapshot,
+        customTerms: termsSnapshot,
+        signal: controller.signal,
+        resumeTranscript: restartFullPipeline ? undefined : partialTranscription || undefined
+      }, {
+        onProgress: (percent) => {
+          if (requestVersionRef.current !== requestVersion) return;
+          setUploadProgress(percent);
+          if (percent === 100) {
+            setProcessingStatus('Media sent. Waiting for speech recognition…');
+          } else {
+            setProcessingStatus(`Sending media: ${percent}%`);
+          }
+        },
+        onStatusUpdate: (statusMessage) => {
+          if (requestVersionRef.current !== requestVersion) return;
+          setProcessingStatus(statusMessage);
+        },
+        onStageResult: (stage, text) => {
+          if (requestVersionRef.current !== requestVersion || stage !== 'transcription' || !text.trim()) return;
+          setPartialTranscription(text);
+          setPartialMetadata({ ...attemptMetadata, completedAt: new Date().toISOString() });
+        }
+      });
+
+      if (requestVersionRef.current !== requestVersion) return;
+
+      setTranscription(result);
+      setGeneratedTranscription(result);
+      setTranscriptTitle(getDefaultTranscriptTitle(selectedFile.name));
+      setTranscriptNotes('');
+      setCompletionMetadata({ ...attemptMetadata, completedAt: new Date().toISOString() });
+      setPartialTranscription('');
+      setPartialMetadata(null);
+      setStatus(AppStatus.COMPLETED);
+    } catch (err: unknown) {
+      if (requestVersionRef.current !== requestVersion) return;
+      if (isAbortError(err) || controller.signal.aborted) return;
+      setError(normalizeTranscriptionError(err));
+      setStatus(AppStatus.ERROR);
+    } finally {
+      if (requestVersionRef.current === requestVersion && activeRequestControllerRef.current === controller) {
+        activeRequestControllerRef.current = null;
+        setUploadProgress(null);
+        setProcessingStatus('');
+      }
+    }
   };
 
+  const handleCancel = () => {
+    if (status !== AppStatus.PROCESSING) return;
+    requestVersionRef.current += 1;
+    activeRequestControllerRef.current?.abort();
+    activeRequestControllerRef.current = null;
+    setUploadProgress(null);
+    setProcessingStatus('');
+    if (routeCheck.status === 'checking') {
+      setRouteCheck({ status: 'idle', report: null });
+      setRouteCheckFingerprint('');
+    }
+    setError(null);
+    setStatus(AppStatus.CANCELLED);
+    announceStatus('Transcription canceled. Your file, route settings, speech hints, and recovered work are preserved.');
+  };
+
+  const handleUseRecoveredTranscript = () => {
+    if (!partialTranscription || !partialMetadata) return;
+    setTranscription(partialTranscription);
+    setGeneratedTranscription(partialTranscription);
+    setTranscriptTitle(getDefaultTranscriptTitle(partialMetadata.source.fileName));
+    setTranscriptNotes('');
+    setCompletionMetadata(partialMetadata);
+    setPartialTranscription('');
+    setPartialMetadata(null);
+    setError(null);
+    setStatus(AppStatus.COMPLETED);
+  };
+
+  const handleReviewSettings = () => {
+    const issueCopy = `${error?.title || ''} ${error?.message || ''}`.toLowerCase();
+    const isSpeechIssue = error?.target === 'stt'
+      || /speech|\bstt\b|whisper|groq|audio transcription/.test(issueCopy);
+    const isModelIssue = error?.code === 'MODEL_NOT_FOUND';
+    const targetSection: ExpertSectionId = provider === ModelProvider.GEMINI
+      ? 'speech'
+      : isModelIssue ? 'models' : 'connections';
+    const targetId = provider === ModelProvider.GEMINI
+      ? 'expert-speech-panel'
+      : error?.code === 'AUTH_FAILED'
+        ? isSpeechIssue ? 'stt-api-key-input' : 'llm-api-key-input'
+        : isSpeechIssue
+          ? isModelIssue ? 'stt-model-identifier' : 'stt-url-input'
+          : isModelIssue ? 'llm-model-identifier' : 'llm-url-input';
+
+    pendingSettingsFocusRef.current = targetId;
+    if (showSettings && openExpertSection === targetSection) {
+      pendingSettingsFocusRef.current = null;
+      focusSettingsTarget(targetId);
+    }
+    setOpenExpertSection(targetSection);
+    setShowSettings(true);
+  };
+
+  const handleReset = () => {
+    requestVersionRef.current += 1;
+    activeRequestControllerRef.current?.abort();
+    activeRequestControllerRef.current = null;
+    setFile(null);
+    setTranscription('');
+    setGeneratedTranscription('');
+    setTranscriptTitle('');
+    setTranscriptNotes('');
+    setCompletionMetadata(null);
+    setPartialTranscription('');
+    setPartialMetadata(null);
+    setStatus(AppStatus.IDLE);
+    setError(null);
+    setUploadProgress(null);
+    setProcessingStatus('');
+    announceStatus('Current file cleared. Choose another audio or video file.');
+    window.requestAnimationFrame(() => document.getElementById('media-file-picker-trigger')?.focus());
+  };
+
+  const engineNames: Record<string, string> = {
+    vllm: 'vLLM',
+    ollama: 'Ollama',
+    lmstudio: 'LM Studio',
+    custom: 'Custom endpoint'
+  };
+
+  const sttEngineNames: Record<string, string> = {
+    faster_whisper: 'Faster-Whisper',
+    vllm_stt: 'vLLM Audio',
+    groq_stt: 'Groq speech',
+    ollama_stt: 'Ollama Audio',
+    custom_stt: 'Custom speech'
+  };
+
+  const selectedEngineName = engineNames[localConfig.engineType || 'vllm'] || localConfig.engineType;
+  const selectedSTTEngineName = sttEngineNames[localConfig.sttEngine || 'faster_whisper'] || localConfig.sttEngine;
+  const isLoopbackEndpoint = (endpoint: string) => {
+    try {
+      const hostname = new URL(endpoint).hostname;
+      return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
+    } catch {
+      return false;
+    }
+  };
+
+  const endpointLabel = (endpoint: string) => {
+    try {
+      const url = new URL(endpoint);
+      return `${url.hostname}${url.port ? `:${url.port}` : ''}`;
+    } catch {
+      return 'configured endpoint';
+    }
+  };
+
+  const llmUsesLoopback = isLoopbackEndpoint(localConfig.baseUrl);
+  const sttUsesLoopback = localConfig.sttEngine !== 'groq_stt' && isLoopbackEndpoint(localConfig.sttUrl);
+  const llmEndpointLabel = endpointLabel(localConfig.baseUrl);
+  const sttEndpointLabel = endpointLabel(localConfig.sttUrl);
+  const activeRouteOutcome: RouteOutcome = provider === ModelProvider.GEMINI
+    ? 'gemini'
+    : localConfig.transcriptionMode === TranscriptionMode.HYBRID
+      ? 'hybrid'
+      : 'configured';
+
+  const configuredRouteLocation = sttUsesLoopback && llmUsesLoopback
+    ? {
+        title: 'Localhost speech → localhost refinement',
+        badge: 'Localhost endpoints',
+        location: 'Media and transcript text are sent to the configured localhost endpoints. Browser-blocked requests may be relayed by the app server.'
+      }
+    : sttUsesLoopback
+      ? {
+          title: 'Localhost speech → configured refinement',
+          badge: 'Localhost + custom endpoint',
+          location: 'Media is sent to the configured localhost speech endpoint; the raw transcript goes to the configured refinement endpoint. Browser-blocked requests may be relayed by the app server.'
+        }
+      : llmUsesLoopback
+        ? {
+            title: 'Configured speech → localhost refinement',
+            badge: 'Custom endpoint + localhost',
+            location: 'Media is sent to the configured speech endpoint; the raw transcript goes to the configured localhost refinement endpoint. Browser-blocked requests may be relayed by the app server.'
+          }
+        : {
+            title: 'Configured speech → configured refinement',
+            badge: 'Custom endpoints',
+            location: 'Media and transcript text are sent to the configured processing endpoints. Browser-blocked requests may be relayed by the app server.'
+          };
+
+  const processingRoute = provider === ModelProvider.GEMINI
+    ? {
+        title: 'Google Gemini transcription',
+        detail: `Google Gemini / ${GEMINI_MODEL}`,
+        badge: 'Cloud',
+        location: 'Media is uploaded to Google Gemini through the app server for transcription.'
+      }
+    : localConfig.transcriptionMode === TranscriptionMode.HYBRID
+      ? {
+          title: llmUsesLoopback ? 'Google Gemini speech → localhost refinement' : 'Google Gemini speech → configured refinement',
+          detail: `Google Gemini / ${GEMINI_MODEL} → ${selectedEngineName} / ${localConfig.llmModel} at ${llmEndpointLabel}`,
+          badge: llmUsesLoopback ? 'Cloud + localhost' : 'Cloud + custom endpoint',
+          location: llmUsesLoopback
+            ? 'Media is uploaded to Google Gemini through the app server; the raw transcript goes to the configured localhost refinement endpoint.'
+            : 'Media is uploaded to Google Gemini through the app server; the raw transcript goes to the configured refinement endpoint.'
+        }
+      : {
+          ...configuredRouteLocation,
+          detail: `${selectedSTTEngineName} / ${localConfig.sttModel} at ${sttEndpointLabel} → ${selectedEngineName} / ${localConfig.llmModel} at ${llmEndpointLabel}`
+        };
+
+  const progressBucket = uploadProgress !== null && uploadProgress < 100
+    ? Math.max(0, Math.floor(uploadProgress / 10) * 10)
+    : null;
+  const accessibleProcessingStatus = progressBucket !== null
+    ? `Sending ${file?.name || 'media file'}: ${progressBucket}% complete.`
+    : processingStatus || 'Processing media and creating the transcript.';
+  const routeStatusPresentation = routeCheck.status === 'checking'
+    ? { label: 'Testing endpoints and models…', tone: 'text-indigo-200', dot: 'bg-indigo-300' }
+    : routeCheck.report?.status === 'compatible'
+      ? { label: routeCheck.report.summary, tone: 'text-emerald-200', dot: 'bg-emerald-300' }
+      : routeCheck.report?.status === 'warning'
+        ? { label: routeCheck.report.summary, tone: 'text-amber-200', dot: 'bg-amber-300' }
+        : routeCheck.report?.status === 'blocked'
+          ? { label: routeCheck.report.summary, tone: 'text-red-200', dot: 'bg-red-300' }
+          : { label: 'Route not tested', tone: 'text-slate-400', dot: 'bg-slate-500' };
+
+  const emptyTranscriptState = !file
+    ? {
+        title: 'Transcript will appear here',
+        body: 'Choose a media file to begin.'
+      }
+    : status === AppStatus.PROCESSING
+      ? {
+          title: 'Transcription in progress',
+          body: 'The transcript workspace will open when processing completes.'
+        }
+      : status === AppStatus.ERROR
+        ? {
+            title: 'Transcription paused',
+            body: 'Use the recovery actions above to continue without losing your work.'
+          }
+        : status === AppStatus.CANCELLED
+          ? {
+              title: 'Transcription canceled',
+              body: 'Retry when ready; your selected media and saved work remain available.'
+            }
+          : {
+              title: 'Ready to transcribe',
+              body: 'Review the processing route, then start transcription.'
+            };
+  const hasCompletedTranscript = status === AppStatus.COMPLETED && completionMetadata !== null;
+  const fileIsVideo = Boolean(file && (
+    file.type.startsWith('video/')
+    || (!file.type && (file.name.toLowerCase().endsWith('.mp4') || file.name.toLowerCase().endsWith('.mov')))
+  ));
+
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-200 selection:bg-indigo-500/30 selection:text-indigo-200">
+    <div className="min-h-screen bg-slate-950 text-slate-200">
+      <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+        <span key={liveAnnouncement.id}>{liveAnnouncement.message}</span>
+      </div>
       
-      {/* Background Gradients */}
-      <div className="fixed inset-0 z-0 overflow-hidden pointer-events-none">
-        <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] bg-indigo-900/20 rounded-full blur-[120px]" />
-        <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] bg-blue-900/20 rounded-full blur-[120px]" />
+      <div className="pointer-events-none fixed inset-0 z-0 overflow-hidden" aria-hidden="true">
+        <SignalToTextMark className="absolute left-1/2 top-[-2rem] h-72 w-[72rem] max-w-none -translate-x-1/2 opacity-[0.055]" />
       </div>
 
-      <div className="relative z-10 max-w-5xl mx-auto px-4 py-12 sm:px-6 lg:px-8">
+      <div className="relative z-10 mx-auto max-w-6xl px-4 py-8 sm:px-6 sm:py-10 lg:px-8 lg:py-12">
         
-        {/* Header */}
-        <header className="mb-12 text-center">
-          <div className="inline-flex items-center justify-center p-3 mb-6 rounded-2xl bg-slate-900/50 ring-1 ring-slate-800 shadow-xl">
-            <svg className="w-8 h-8 text-indigo-500 mr-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v-4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
-            </svg>
-            <h1 className="text-3xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-white to-slate-400">
-              Media Scribe
-            </h1>
+        <header className="mb-8 border-b border-slate-800/90 pb-7 lg:mb-10 lg:pb-8">
+          <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_22rem] lg:items-end">
+            <div className="min-w-0">
+              <div className="flex items-center gap-4">
+                <span className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl border border-indigo-400/30 bg-indigo-500/10" aria-hidden="true">
+                  <span className="flex items-center gap-1">
+                    <span className="h-3 w-1 rounded-full bg-indigo-300/70" />
+                    <span className="h-6 w-1 rounded-full bg-indigo-300" />
+                    <span className="h-9 w-1 rounded-full bg-indigo-200" />
+                    <span className="h-5 w-1 rounded-full bg-indigo-300" />
+                    <span className="h-7 w-1 rounded-full bg-indigo-300/80" />
+                  </span>
+                </span>
+                <h1 className="min-w-0 font-editorial text-4xl font-semibold leading-[0.98] tracking-[-0.03em] text-slate-50 [overflow-wrap:anywhere] sm:text-5xl">
+                  Media Scribe
+                </h1>
+              </div>
+              <p className="mt-4 max-w-[65ch] text-base leading-7 text-slate-300">
+                Turn audio and video into editable, export-ready transcripts. Use Google Gemini or your own speech and language-model endpoints; the processing route below shows where each stage runs.
+              </p>
+            </div>
+
+            <div className="relative overflow-hidden rounded-2xl border border-slate-800 bg-slate-900/55 px-4 py-3">
+              <SignalToTextMark className="h-16 w-full" />
+              <div className="flex items-start justify-between gap-4 border-t border-slate-800 pt-2 font-mono text-xs font-medium text-slate-400">
+                <span className="min-w-0 text-left [overflow-wrap:anywhere]">Media signal</span>
+                <span className="min-w-0 text-right [overflow-wrap:anywhere]">Editable transcript</span>
+              </div>
+            </div>
           </div>
-          <p className="text-lg text-slate-400 max-w-2xl mx-auto">
-            Transform audio & video into structured transcriptions using <strong>Local LLMs & STT (vLLM, Gemma 4, GPT-OSS, Ollama, Whisper)</strong> or <strong>Google Gemini Cloud</strong>. Private, fast, and 100% offline ready.
-          </p>
         </header>
 
         {/* Main Content Area */}
-        <main className="space-y-8">
+        <main>
+          <ol className="list-none space-y-8 sm:space-y-10" role="list">
+            <li>
+              <section aria-labelledby="media-stage-title">
+                <WorkflowStageHeader
+                  number={1}
+                  id="media-stage-title"
+                  title="Choose media"
+                  description="Select one audio or video file and confirm the source before processing."
+                  state={file ? 'complete' : 'current'}
+                />
+            <div className="rounded-2xl border border-slate-800 bg-slate-900/50 p-4 shadow-xl shadow-slate-950/25 backdrop-blur-md sm:p-6">
+              <div className="mb-4 flex items-start justify-between gap-4">
+                <div>
+                  <h3 id="media-upload-title" className="text-lg font-semibold text-slate-50">Media file</h3>
+                  <p className="mt-1 text-sm leading-6 text-slate-400">Choose one audio or video file to transcribe.</p>
+                </div>
+                {file && status !== AppStatus.PROCESSING && status !== AppStatus.COMPLETED && (
+                  <button
+                    type="button"
+                    onClick={handleReset}
+                    className="min-h-11 shrink-0 whitespace-nowrap rounded-lg px-3 text-sm font-medium text-red-300 transition-colors hover:bg-red-500/10 hover:text-red-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-300 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-900 motion-reduce:transition-none"
+                  >
+                    Remove file
+                  </button>
+                )}
+              </div>
 
-          {/* Model Processing Engine Settings */}
-          <section className="bg-slate-900/50 backdrop-blur-md rounded-2xl border border-slate-800 p-6 shadow-xl relative overflow-hidden transition-all duration-300">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-4">
-              <div>
-                <h3 className="text-lg font-semibold text-slate-200 flex items-center gap-2 animate-fadeIn">
-                  <svg className="w-5 h-5 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066-1.543.94-3.31-.826-2.37-2.37c-.708-.43-1.065-1.123-1.065-2.572-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543-.826-3.31-2.37-2.37-.996.608-2.296.07-2.572-1.065z" />
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+              {!file ? (
+                <FileUploader onFileSelect={handleFileSelect} />
+              ) : (
+                <div className="min-w-0 animate-fadeIn">
+                  <div className="flex min-w-0 items-center gap-3">
+                    <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-indigo-500/15 text-indigo-300 ring-1 ring-inset ring-indigo-400/20">
+                      {fileIsVideo ? (
+                        <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M4 6.5h11a2 2 0 012 2v7a2 2 0 01-2 2H4a2 2 0 01-2-2v-7a2 2 0 012-2zM17 10l5-2.5v9L17 14" />
+                        </svg>
+                      ) : (
+                        <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M4 12h2m2-5v10m4-13v16m4-12v8m4-6v4" />
+                        </svg>
+                      )}
+                    </div>
+                    <div className="min-w-0">
+                      <p className="max-w-full font-medium text-slate-100 [overflow-wrap:anywhere]">{file.name}</p>
+                      <p className="mt-0.5 text-sm text-slate-400">{formatFileSize(file.size)}</p>
+                    </div>
+                  </div>
+
+                  {objectUrl && (
+                    fileIsVideo ? (
+                      <video
+                        controls
+                        src={objectUrl}
+                        aria-label={`Video preview for ${file.name}`}
+                        className="mt-4 max-h-56 w-full min-w-0 max-w-full rounded-lg border border-slate-700 bg-slate-950"
+                      />
+                    ) : (
+                      <audio
+                        controls
+                        src={objectUrl}
+                        aria-label={`Audio preview for ${file.name}`}
+                        className="mt-4 h-11 w-full min-w-0 max-w-full rounded-lg"
+                      />
+                    )
+                  )}
+                </div>
+              )}
+
+            </div>
+              </section>
+            </li>
+
+            <li>
+              <section aria-labelledby="preparation-stage-title">
+                <WorkflowStageHeader
+                  number={2}
+                  id="preparation-stage-title"
+                  title="Prepare transcription"
+                  description="Confirm the processing route, add optional speech hints, then start."
+                  focusable
+                  state={hasCompletedTranscript ? 'complete' : file ? 'current' : 'upcoming'}
+                />
+
+                <div className={`grid items-start gap-4 ${hasCompletedTranscript ? '' : 'xl:grid-cols-[minmax(0,1.25fr)_minmax(20rem,0.75fr)]'}`}>
+                  <article
+                    className={`relative overflow-hidden rounded-2xl border border-slate-700/80 bg-slate-900/60 p-4 shadow-lg shadow-slate-950/20 transition-colors duration-200 motion-reduce:transition-none sm:p-5 ${hasCompletedTranscript ? 'xl:col-span-2' : ''}`}
+                    aria-labelledby="processing-route-title"
+                  >
+            <div className="flex flex-col gap-5 md:flex-row md:items-start md:justify-between">
+              <div className="flex min-w-0 items-start gap-3">
+                <div className="mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-indigo-500/10 text-indigo-300 ring-1 ring-inset ring-indigo-500/20">
+                  <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.75} d="M4 7h10m0 0-3-3m3 3-3 3m9 7H10m0 0 3 3m-3-3 3-3" />
                   </svg>
-                  Translation & Processing Engine
-                </h3>
-                <p className="text-xs text-slate-400 mt-1">
-                  Select between Cloud Gemini or local inference engines (Ollama, LM Studio) to handle transcription.
+                </div>
+                <div className="min-w-0">
+                  <h3 id="processing-route-title" className="text-lg font-semibold text-slate-50">Processing route</h3>
+                  <div className="mt-1 flex min-w-0 flex-wrap items-center gap-2">
+                    <p className="min-w-0 text-base font-semibold text-slate-100 [overflow-wrap:anywhere]">{processingRoute.title}</p>
+                    <span className="rounded-full bg-slate-800 px-2.5 py-1 text-xs font-semibold text-slate-300 ring-1 ring-inset ring-slate-600">
+                      {processingRoute.badge}
+                    </span>
+                  </div>
+                  <p className="mt-1 min-w-0 text-sm leading-6 text-slate-400 [overflow-wrap:anywhere]">{processingRoute.detail}</p>
+                  <p
+                    id="processing-route-status"
+                    tabIndex={-1}
+                    className={`mt-3 flex min-w-0 items-start gap-2 rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-300 ${routeStatusPresentation.tone}`}
+                  >
+                    <span className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${routeStatusPresentation.dot}`} aria-hidden="true" />
+                    <span className="min-w-0 text-xs font-medium leading-5 [overflow-wrap:anywhere]">{routeStatusPresentation.label}</span>
+                  </p>
+                </div>
+              </div>
+              <div className="w-full md:w-auto md:max-w-xs md:shrink-0">
+                <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 md:flex md:justify-end">
+                  <button
+                    type="button"
+                    onClick={handleCheckRoute}
+                    disabled={status === AppStatus.PROCESSING || routeCheck.status === 'checking'}
+                    aria-busy={routeCheck.status === 'checking' || undefined}
+                    aria-describedby="processing-route-status route-test-guidance"
+                    className="inline-flex min-h-11 w-full items-center justify-center gap-2 rounded-lg bg-slate-950/70 px-3 py-2 text-sm font-medium text-slate-200 ring-1 ring-inset ring-slate-600 transition-colors hover:bg-slate-800 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-300 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-950 disabled:cursor-not-allowed disabled:opacity-50 motion-reduce:transition-none md:w-auto"
+                  >
+                    <svg className={`h-4 w-4 ${routeCheck.status === 'checking' ? 'animate-spin motion-reduce:animate-none' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8 8 0 104.582 9M20 20v-5h-.581" />
+                    </svg>
+                    {routeCheck.status === 'checking' ? 'Testing route…' : 'Test route'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowSettings(!showSettings)}
+                    disabled={status === AppStatus.PROCESSING}
+                    aria-expanded={showSettings}
+                    aria-controls="expert-processing-settings"
+                    className="inline-flex min-h-11 w-full items-center justify-center gap-2 rounded-lg bg-slate-800 px-3 py-2 text-sm font-medium text-slate-200 ring-1 ring-inset ring-slate-700 transition-colors hover:bg-slate-700 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-300 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-950 disabled:cursor-not-allowed disabled:opacity-50 motion-reduce:transition-none md:w-auto"
+                  >
+                    {showSettings ? 'Hide expert settings' : 'Expert settings'}
+                    <svg className={`h-4 w-4 transition-transform duration-200 ${showSettings ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                    </svg>
+                  </button>
+                </div>
+                <p id="route-test-guidance" className="mt-2 text-xs leading-5 text-slate-400 md:text-right">
+                  <span className="font-semibold text-slate-300">Optional.</span> Recommended before large uploads or whenever you change the route.
                 </p>
               </div>
-              <button 
-                type="button"
-                onClick={() => setShowSettings(!showSettings)}
-                className="text-xs font-medium text-indigo-400 hover:text-indigo-300 transition-colors flex items-center gap-1 self-start sm:self-center"
-              >
-                {showSettings ? "Collapse options" : "Configure endpoints"}
-                <svg className={`w-4 h-4 transition-transform duration-200 ${showSettings ? "rotate-180" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                </svg>
-              </button>
             </div>
 
-            {/* Selector Buttons */}
-            <div className="grid grid-cols-2 gap-3 p-1 bg-slate-950 rounded-xl border border-slate-800">
-              <button
-                type="button"
-                onClick={() => setProvider(ModelProvider.GEMINI)}
-                className={`py-2 text-sm font-medium rounded-lg transition-all flex items-center justify-center gap-2 ${
-                  provider === ModelProvider.GEMINI
-                    ? "bg-indigo-600/90 text-white shadow-lg shadow-indigo-500/10"
-                    : "text-slate-400 hover:text-slate-200 hover:bg-slate-900/40"
-                }`}
-              >
-                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z" />
-                </svg>
-                Google Gemini Cloud
-              </button>
-              <button
-                type="button"
-                onClick={() => setProvider(ModelProvider.LOCAL)}
-                className={`py-2 text-sm font-medium rounded-lg transition-all flex items-center justify-center gap-2 ${
-                  provider === ModelProvider.LOCAL
-                    ? "bg-indigo-600/90 text-white shadow-lg shadow-indigo-500/10"
-                    : "text-slate-400 hover:text-slate-200 hover:bg-slate-900/40"
-                }`}
-              >
-                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-                </svg>
-                Local Models (Ollama / Gemma)
-              </button>
-            </div>
+            {routeCheck.report && (
+              <details className="mt-4 rounded-xl bg-slate-950/40 px-3 py-2 text-xs text-slate-300 ring-1 ring-inset ring-slate-800">
+                <summary className="flex min-h-11 cursor-pointer items-center py-2 font-medium text-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-300">
+                  Route test details
+                </summary>
+                <ul className="mt-1 space-y-2 pb-1">
+                  {routeCheck.report.checks.map(check => (
+                    <li key={check.target} className="flex min-w-0 items-start gap-2">
+                      <span className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${check.status === 'pass' ? 'bg-emerald-300' : check.status === 'warning' ? 'bg-amber-300' : 'bg-red-300'}`} aria-hidden="true" />
+                      <span className="min-w-0 [overflow-wrap:anywhere]"><strong className="text-slate-200">{check.label} — {check.status}.</strong> {check.detail}</span>
+                    </li>
+                  ))}
+                </ul>
+              </details>
+            )}
+                  </article>
 
-            {/* Local Config Fields */}
-            {provider === ModelProvider.LOCAL && showSettings && (
-              <div className="mt-4 p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-5 animate-fadeIn">
-                
-                {/* Local Engine Architecture Selector */}
-                <div>
-                  <label className="block text-xs font-medium text-slate-400 mb-2 uppercase tracking-wider">
-                    Local Inference Backend / Engine Framework
-                  </label>
-                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                    {[
-                      { id: 'vllm', name: 'vLLM Library', desc: 'Port 8000 / OpenAI API' },
-                      { id: 'ollama', name: 'Ollama Native', desc: 'Port 11434' },
-                      { id: 'lmstudio', name: 'LM Studio', desc: 'Port 1234 / OpenAI API' },
-                      { id: 'custom', name: 'Custom OpenAI', desc: 'Bearer token / Custom' }
-                    ].map((eng) => (
-                      <button
-                        type="button"
-                        key={eng.id}
-                        onClick={() => handleEngineChange(eng.id as LocalEngineType)}
-                        className={`p-2.5 rounded-xl text-left transition-all border ${
-                          (localConfig.engineType || 'vllm') === eng.id
-                            ? "bg-indigo-600/20 border-indigo-500/50 text-indigo-200 shadow-md shadow-indigo-500/5"
-                            : "bg-slate-900/60 border-slate-800/80 text-slate-400 hover:text-slate-200 hover:bg-slate-900"
-                        }`}
-                      >
-                        <div className="font-semibold text-xs flex items-center justify-between">
-                          {eng.name}
-                          {(localConfig.engineType || 'vllm') === eng.id && (
-                            <span className="w-2 h-2 rounded-full bg-indigo-400 animate-pulse" />
-                          )}
-                        </div>
-                        <div className="text-[10px] text-slate-500 mt-0.5 truncate">{eng.desc}</div>
-                      </button>
-                    ))}
-                  </div>
+                  {!hasCompletedTranscript && (
+                    <SpeechHints
+                      inputRef={termsInputRef}
+                      termsText={termsText}
+                      termsList={termsList}
+                      termsFileName={termsFileName}
+                      termsError={termsError}
+                      isDragging={isDraggingTerms}
+                      disabled={status === AppStatus.PROCESSING}
+                      onClear={handleClearTerms}
+                      onFileSelect={handleTermsFileSelect}
+                      onFileDrop={handleTermsFileDrop}
+                      onDragStateChange={setIsDraggingTerms}
+                      onTextChange={handleTermsTextChange}
+                    />
+                  )}
                 </div>
 
-                {/* Base URL and API Key Inputs */}
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-1">
-                  <div>
-                    <label className="block text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wider">
-                      Local Server Base URL
-                    </label>
-                    <input
-                      type="text"
-                      value={localConfig.baseUrl}
-                      onChange={(e) => setLocalConfig({ ...localConfig, baseUrl: e.target.value })}
-                      className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
-                      placeholder="e.g., http://localhost:8000/v1"
-                    />
-                    <p className="text-[10px] text-indigo-400/80 mt-1 flex items-center gap-1">
-                      <span>💡</span>
-                      {localConfig.engineType === 'vllm' && 'vLLM default server is http://localhost:8000/v1'}
-                      {localConfig.engineType === 'ollama' && 'Ollama default server is http://localhost:11434'}
-                      {localConfig.engineType === 'lmstudio' && 'LM Studio default server is http://localhost:1234/v1'}
-                      {(!localConfig.engineType || localConfig.engineType === 'custom') && 'Custom OpenAI-compatible URL'}
-                    </p>
+            <ExpertSettings
+              hidden={!showSettings}
+              disabled={status === AppStatus.PROCESSING}
+              provider={provider}
+              localConfig={localConfig}
+              activeRouteOutcome={activeRouteOutcome}
+              openSection={openExpertSection}
+              selectedEngineName={selectedEngineName}
+              selectedSTTEngineName={selectedSTTEngineName}
+              llmUsesLoopback={llmUsesLoopback}
+              sttUsesLoopback={sttUsesLoopback}
+              isFetchingModels={isFetchingModels}
+              fetchedModels={fetchedModels}
+              fetchModelsStatus={fetchModelsStatus}
+              isFetchingSTTModels={isFetchingSTTModels}
+              fetchedSTTModels={fetchedSTTModels}
+              fetchSTTModelsStatus={fetchSTTModelsStatus}
+              onOpenSectionChange={setOpenExpertSection}
+              onRouteOutcomeChange={handleRouteOutcomeChange}
+              onConfigChange={setLocalConfig}
+              onEngineChange={handleEngineChange}
+              onSTTEngineChange={handleSTTEngineChange}
+              onFetchModels={handleFetchModels}
+              onFetchSTTModels={handleFetchSTTModels}
+            />
+
+                <div className="mt-5 flex flex-col gap-4 border-t border-slate-800 pt-5 sm:flex-row sm:items-center sm:justify-between">
+                  <div id="processing-location-summary" className="flex min-w-0 max-w-2xl items-start gap-3">
+                    <span className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-indigo-500/10 text-indigo-300 ring-1 ring-inset ring-indigo-500/25">
+                      <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M12 21s6-5.4 6-11a6 6 0 10-12 0c0 5.6 6 11 6 11z" />
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M12 12.5a2.5 2.5 0 100-5 2.5 2.5 0 000 5z" />
+                      </svg>
+                    </span>
+                    <span className="min-w-0">
+                      <span className="block text-xs font-semibold text-slate-300">Processing location</span>
+                      <span className="mt-0.5 block text-sm leading-6 text-slate-400 [overflow-wrap:anywhere]">{processingRoute.location}</span>
+                    </span>
                   </div>
 
-                  <div>
-                    <label className="block text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wider">
-                      Optional Auth Key / Bearer Token
-                    </label>
-                    <input
-                      type="password"
-                      value={localConfig.apiKey || ''}
-                      onChange={(e) => setLocalConfig({ ...localConfig, apiKey: e.target.value })}
-                      className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
-                      placeholder="Optional API key or Bearer token (if required)"
-                    />
-                    <p className="text-[10px] text-slate-500 mt-1">
-                      Passed as Authorization Bearer header if provided.
-                    </p>
-                  </div>
+                  {file && status === AppStatus.IDLE && (
+                    <Button
+                      id="start-transcription-button"
+                      type="button"
+                      onClick={() => handleTranscribe()}
+                      aria-describedby="processing-location-summary processing-route-status"
+                      className="w-full shrink-0 px-6 py-3 text-base sm:w-auto"
+                    >
+                      Start transcription
+                    </Button>
+                  )}
                 </div>
 
-                {/* Model Identifier Selection & Auto Discovery */}
-                <div className="pt-2 border-t border-slate-900">
-                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-2">
-                    <label className="text-xs font-medium text-slate-400 uppercase tracking-wider">
-                      Active LLM Model Identifier (e.g., gemma4, gpt-oss)
-                    </label>
+                {status === AppStatus.PROCESSING && (
+                  <div
+                    ref={processingRegionRef}
+                    tabIndex={-1}
+                    className="mt-5 flex flex-col items-center space-y-3 rounded-xl border border-indigo-400/30 bg-indigo-900/10 p-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-300 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-900"
+                    role="group"
+                    aria-label="Transcription in progress"
+                  >
+                    <p className="max-w-lg text-center text-xs font-medium text-indigo-200">
+                      Processing via {processingRoute.title} · {processingRoute.badge}
+                    </p>
+                    <div
+                      className="h-1.5 w-full max-w-xs overflow-hidden rounded-full bg-slate-700"
+                      role="progressbar"
+                      aria-label="Transcription progress"
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      aria-valuenow={uploadProgress ?? undefined}
+                      aria-valuetext={accessibleProcessingStatus}
+                    >
+                      {uploadProgress !== null ? (
+                        <div
+                          className="h-full bg-indigo-400 transition-[width] duration-300 ease-out motion-reduce:transition-none"
+                          style={{ width: `${uploadProgress}%` }}
+                        />
+                      ) : (
+                        <div className="h-full w-1/3 bg-indigo-400 animate-progress motion-reduce:animate-none" />
+                      )}
+                    </div>
+                    <p className="min-h-5 max-w-lg break-words text-center text-sm leading-5 text-indigo-100" aria-hidden="true">
+                      {processingStatus || 'Processing media and creating the transcript…'}
+                    </p>
+                    <p id="processing-live-status" className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+                      {accessibleProcessingStatus}
+                    </p>
                     <button
                       type="button"
-                      onClick={handleFetchModels}
-                      disabled={isFetchingModels}
-                      className="text-xs text-indigo-400 hover:text-indigo-300 font-medium flex items-center gap-1.5 bg-indigo-500/10 hover:bg-indigo-500/20 px-2.5 py-1 rounded-lg border border-indigo-500/20 transition-all self-start sm:self-auto cursor-pointer disabled:opacity-50"
+                      onClick={handleCancel}
+                      className="min-h-11 rounded-lg px-4 py-2 text-sm font-semibold text-indigo-100 ring-1 ring-inset ring-indigo-300/50 transition-colors hover:bg-indigo-300/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-200 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-900 motion-reduce:transition-none"
                     >
-                      <svg className={`w-3.5 h-3.5 ${isFetchingModels ? "animate-spin" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                      </svg>
-                      {isFetchingModels ? "Querying server..." : "Auto-Discover Loaded Models"}
+                      Cancel transcription
                     </button>
                   </div>
+                )}
 
-                  <input
-                    type="text"
-                    value={localConfig.llmModel}
-                    onChange={(e) => setLocalConfig({ ...localConfig, llmModel: e.target.value })}
-                    className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
-                    placeholder="e.g., gemma4, google/gemma-4-9b-it, or gpt-oss"
-                  />
-
-                  {/* Status / Active models select dropdown */}
-                  {fetchModelsStatus && (
-                    <div className="mt-2 text-[11px] text-slate-300 bg-slate-900/80 p-2 rounded-lg border border-slate-800">
-                      <p>{fetchModelsStatus}</p>
-                      {fetchedModels && fetchedModels.length > 0 && (
-                        <div className="mt-2 flex flex-wrap gap-1.5 items-center">
-                          <span className="text-slate-400 font-medium text-[10px]">Select active model:</span>
-                          {fetchedModels.map((m) => (
-                            <button
-                              type="button"
-                              key={m}
-                              onClick={() => setLocalConfig({ ...localConfig, llmModel: m })}
-                              className={`px-2 py-0.5 rounded text-[10px] font-mono transition-colors border ${
-                                localConfig.llmModel === m
-                                  ? "bg-indigo-500 text-white border-indigo-400 font-bold"
-                                  : "bg-slate-800 hover:bg-slate-700 text-indigo-300 border-indigo-500/30"
-                              }`}
-                            >
-                              {m}
-                            </button>
-                          ))}
-                        </div>
+                {error && (
+                  <div
+                    ref={errorRegionRef}
+                    tabIndex={-1}
+                    className="mt-5 flex items-start gap-3 rounded-xl border border-red-400/40 bg-red-900/20 p-4 text-sm text-red-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-300 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-900"
+                    role="alert"
+                    aria-atomic="true"
+                  >
+                    <svg className="mt-0.5 h-5 w-5 shrink-0 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                    <div className="min-w-0 flex-1 space-y-2 [overflow-wrap:anywhere]">
+                      <h3 className="font-semibold text-red-50">{error.title}</h3>
+                      <p>{error.message}</p>
+                      <p className="text-red-100/90">{error.suggestion}</p>
+                      {partialTranscription && (
+                        <p className="rounded-lg bg-slate-950/50 px-3 py-2 text-slate-200 ring-1 ring-inset ring-slate-700">
+                          A raw transcript was saved. Retry refinement to continue without sending the media through speech recognition again.
+                        </p>
                       )}
-                    </div>
-                  )}
-
-                  {/* Curated Preset Chips */}
-                  <div className="mt-3 space-y-2">
-                    <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider block">
-                      Quick Model Presets:
-                    </span>
-                    <div className="flex flex-wrap gap-1.5">
-                      {/* Gemma 4 Family */}
-                      <span className="text-[10px] text-indigo-400/90 font-medium self-center mr-1">Gemma 4:</span>
-                      {['gemma4', 'gemma-4-9b-it', 'google/gemma-4-27b-it'].map((item) => (
-                        <button
-                          type="button"
-                          key={item}
-                          onClick={() => setLocalConfig({ ...localConfig, llmModel: item })}
-                          className={`px-2 py-0.5 rounded text-[10px] font-mono transition-colors border ${
-                            localConfig.llmModel === item
-                              ? "bg-indigo-500/30 text-indigo-200 border-indigo-400"
-                              : "bg-slate-900 hover:bg-slate-850 text-slate-300 border-slate-800"
-                          }`}
-                        >
-                          {item}
-                        </button>
-                      ))}
-
-                      {/* GPT-OSS Family */}
-                      <span className="text-[10px] text-emerald-400/90 font-medium self-center ml-2 mr-1">GPT-OSS:</span>
-                      {['gpt-oss', 'gpt-oss-13b', 'openai/gpt-oss-20b'].map((item) => (
-                        <button
-                          type="button"
-                          key={item}
-                          onClick={() => setLocalConfig({ ...localConfig, llmModel: item })}
-                          className={`px-2 py-0.5 rounded text-[10px] font-mono transition-colors border ${
-                            localConfig.llmModel === item
-                              ? "bg-emerald-500/30 text-emerald-200 border-emerald-400"
-                              : "bg-slate-900 hover:bg-slate-850 text-slate-300 border-slate-800"
-                          }`}
-                        >
-                          {item}
-                        </button>
-                      ))}
-
-                      {/* Open Models */}
-                      <span className="text-[10px] text-sky-400/90 font-medium self-center ml-2 mr-1">Open:</span>
-                      {['gemma2', 'llama3.3', 'qwen2.5', 'mistral'].map((item) => (
-                        <button
-                          type="button"
-                          key={item}
-                          onClick={() => setLocalConfig({ ...localConfig, llmModel: item })}
-                          className={`px-2 py-0.5 rounded text-[10px] font-mono transition-colors border ${
-                            localConfig.llmModel === item
-                              ? "bg-sky-500/30 text-sky-200 border-sky-400"
-                              : "bg-slate-900 hover:bg-slate-850 text-slate-300 border-slate-800"
-                          }`}
-                        >
-                          {item}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                </div>
-
-                {/* Local Processing Mode */}
-                <div className="pt-2 border-t border-slate-900/80">
-                  <label className="block text-xs font-medium text-slate-400 mb-2 uppercase tracking-wider">
-                    Local Processing Strategy
-                  </label>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    <label className={`flex flex-col p-3 rounded-lg border cursor-pointer transition-all ${
-                      localConfig.transcriptionMode === TranscriptionMode.HYBRID
-                        ? "bg-indigo-950/20 border-indigo-500/20 text-indigo-200"
-                        : "bg-slate-900/30 border-slate-800 text-slate-400 hover:bg-slate-900/50"
-                    }`}>
-                      <span className="flex items-center gap-2 font-medium text-xs">
-                        <input
-                          type="radio"
-                          name="transcriptionMode"
-                          checked={localConfig.transcriptionMode === TranscriptionMode.HYBRID}
-                          onChange={() => setLocalConfig({ ...localConfig, transcriptionMode: TranscriptionMode.HYBRID })}
-                          className="accent-indigo-500"
-                        />
-                        Hybrid Pipeline (Fast Cloud STT + Local vLLM/Gemma Refinement)
-                      </span>
-                      <span className="text-[10px] opacity-70 mt-1 pl-5 leading-normal">
-                        Cloud Gemini quickly transcribes raw audio up to 500MB, then your local vLLM / Gemma 4 / GPT-OSS structures & formats the final document offline.
-                      </span>
-                    </label>
-
-                    <label className={`flex flex-col p-3 rounded-lg border cursor-pointer transition-all ${
-                      localConfig.transcriptionMode === TranscriptionMode.LOCAL_STT
-                        ? "bg-indigo-950/20 border-indigo-500/20 text-indigo-200"
-                        : "bg-slate-900/30 border-slate-800 text-slate-400 hover:bg-slate-900/50"
-                    }`}>
-                      <span className="flex items-center gap-2 font-medium text-xs">
-                        <input
-                          type="radio"
-                          name="transcriptionMode"
-                          checked={localConfig.transcriptionMode === TranscriptionMode.LOCAL_STT}
-                          onChange={() => setLocalConfig({ ...localConfig, transcriptionMode: TranscriptionMode.LOCAL_STT })}
-                          className="accent-indigo-500"
-                        />
-                        100% Offline (Local Whisper STT + Local vLLM/Gemma)
-                      </span>
-                      <span className="text-[10px] opacity-70 mt-1 pl-5 leading-normal">
-                        Fully local flow. Audio is transcribed via local Whisper server, then processed locally by vLLM or Ollama.
-                      </span>
-                    </label>
-                  </div>
-                </div>
-
-                {localConfig.transcriptionMode === TranscriptionMode.LOCAL_STT && (
-                  <div className="pt-3 border-t border-slate-900 space-y-4">
-                    {/* STT Engine Architecture Selector */}
-                    <div>
-                      <label className="block text-xs font-medium text-slate-400 mb-2 uppercase tracking-wider">
-                        Speech Recognition (STT) Engine & Provider
-                      </label>
-                      <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
-                        {[
-                          { id: 'faster_whisper', name: 'Faster-Whisper', desc: 'Port 1234 / High speed' },
-                          { id: 'vllm_stt', name: 'vLLM Audio', desc: 'Port 8000 / vLLM STT' },
-                          { id: 'groq_stt', name: 'Groq Cloud STT', desc: 'Real-time Fast Cloud' },
-                          { id: 'ollama_stt', name: 'Ollama Audio', desc: 'Port 11434 / Whisper' },
-                          { id: 'custom_stt', name: 'Custom Endpoint', desc: 'Custom OpenAI STT' },
-                        ].map((eng) => (
-                          <button
-                            type="button"
-                            key={eng.id}
-                            onClick={() => handleSTTEngineChange(eng.id as STTEngineType)}
-                            className={`p-2 rounded-xl text-left transition-all border ${
-                              (localConfig.sttEngine || 'faster_whisper') === eng.id
-                                ? "bg-indigo-600/20 border-indigo-500/50 text-indigo-200 shadow-md shadow-indigo-500/5"
-                                : "bg-slate-900/60 border-slate-800/80 text-slate-400 hover:text-slate-200 hover:bg-slate-900"
-                            }`}
-                          >
-                            <div className="font-semibold text-xs flex items-center justify-between">
-                              {eng.name}
-                              {(localConfig.sttEngine || 'faster_whisper') === eng.id && (
-                                <span className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-pulse" />
-                              )}
-                            </div>
-                            <div className="text-[9px] text-slate-500 mt-0.5 truncate">{eng.desc}</div>
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-
-                    {/* STT URL, API Key, and Spoken Language */}
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                      <div>
-                        <label className="block text-xs font-medium text-slate-400 mb-1 uppercase tracking-wider">
-                          STT Endpoint URL
-                        </label>
-                        <input
-                          type="text"
-                          value={localConfig.sttUrl}
-                          onChange={(e) => setLocalConfig({ ...localConfig, sttUrl: e.target.value })}
-                          className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
-                          placeholder="e.g., http://localhost:1234/v1 or https://api.groq.com/openai/v1"
-                        />
-                      </div>
-
-                      <div>
-                        <label className="block text-xs font-medium text-slate-400 mb-1 uppercase tracking-wider">
-                          Dedicated STT Auth / API Key
-                        </label>
-                        <input
-                          type="password"
-                          value={localConfig.sttApiKey || ''}
-                          onChange={(e) => setLocalConfig({ ...localConfig, sttApiKey: e.target.value })}
-                          className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
-                          placeholder="Optional (e.g. gsk_... for Groq)"
-                        />
-                      </div>
-
-                      <div>
-                        <label className="block text-xs font-medium text-slate-400 mb-1 uppercase tracking-wider">
-                          Audio Spoken Language
-                        </label>
-                        <select
-                          value={localConfig.sttLanguage || 'auto'}
-                          onChange={(e) => setLocalConfig({ ...localConfig, sttLanguage: e.target.value })}
-                          className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono cursor-pointer"
-                        >
-                          <option value="auto">🌐 Auto-Detect Language</option>
-                          <option value="en">🇺🇸 English (en)</option>
-                          <option value="es">🇪🇸 Spanish (es)</option>
-                          <option value="fr">🇫🇷 French (fr)</option>
-                          <option value="de">🇩🇪 German (de)</option>
-                          <option value="zh">🇨🇳 Chinese (zh)</option>
-                          <option value="ja">🇯🇵 Japanese (ja)</option>
-                          <option value="ru">🇷🇺 Russian (ru)</option>
-                          <option value="pt">🇵🇹 Portuguese (pt)</option>
-                          <option value="it">🇮🇹 Italian (it)</option>
-                        </select>
-                      </div>
-                    </div>
-
-                    {/* Active STT Model Identifier & Discovery */}
-                    <div className="pt-2 border-t border-slate-900/80">
-                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-1.5">
-                        <label className="text-xs font-medium text-slate-400 uppercase tracking-wider">
-                          Active STT Model Identifier
-                        </label>
-                        <button
-                          type="button"
-                          onClick={handleFetchSTTModels}
-                          disabled={isFetchingSTTModels}
-                          className="text-xs text-indigo-400 hover:text-indigo-300 font-medium flex items-center gap-1.5 bg-indigo-500/10 hover:bg-indigo-500/20 px-2.5 py-1 rounded-lg border border-indigo-500/20 transition-all self-start sm:self-auto cursor-pointer disabled:opacity-50"
-                        >
-                          <svg className={`w-3.5 h-3.5 ${isFetchingSTTModels ? "animate-spin" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                          </svg>
-                          {isFetchingSTTModels ? "Querying STT server..." : "Auto-Discover STT Models"}
-                        </button>
-                      </div>
-
-                      <input
-                        type="text"
-                        value={localConfig.sttModel}
-                        onChange={(e) => setLocalConfig({ ...localConfig, sttModel: e.target.value })}
-                        className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono"
-                        placeholder="e.g. whisper-large-v3-turbo, SenseVoiceSmall, distil-whisper-large-v3"
-                      />
-
-                      {fetchSTTModelsStatus && (
-                        <div className="mt-2 text-[11px] text-slate-300 bg-slate-900/80 p-2 rounded-lg border border-slate-800">
-                          <p>{fetchSTTModelsStatus}</p>
-                          {fetchedSTTModels && fetchedSTTModels.length > 0 && (
-                            <div className="mt-2 flex flex-wrap gap-1.5 items-center">
-                              <span className="text-slate-400 font-medium text-[10px]">Select active STT model:</span>
-                              {fetchedSTTModels.map((m) => (
-                                <button
-                                  type="button"
-                                  key={m}
-                                  onClick={() => setLocalConfig({ ...localConfig, sttModel: m })}
-                                  className={`px-2 py-0.5 rounded text-[10px] font-mono transition-colors border ${
-                                    localConfig.sttModel === m
-                                      ? "bg-indigo-500 text-white border-indigo-400 font-bold"
-                                      : "bg-slate-800 hover:bg-slate-700 text-indigo-300 border-indigo-500/30"
-                                  }`}
-                                >
-                                  {m}
-                                </button>
-                              ))}
-                            </div>
-                          )}
-                        </div>
+                      {error.technicalDetail && (
+                        <details className="text-xs text-red-100/80">
+                          <summary className="inline-flex min-h-11 cursor-pointer items-center rounded font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-300">Technical detail</summary>
+                          <p className="mt-1 font-mono [overflow-wrap:anywhere]">{error.technicalDetail}</p>
+                        </details>
                       )}
-
-                      {/* Capable Presets for Modern Real-Time & High Precision Models */}
-                      <div className="mt-3 space-y-2">
-                        <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider block">
-                          Modern Capable & Real-Time STT Presets:
-                        </span>
-                        <div className="flex flex-wrap gap-1.5">
-                          {/* Real-time / Low Latency */}
-                          <span className="text-[10px] text-amber-400/90 font-medium self-center mr-1">⚡ Real-Time Fast:</span>
-                          {[
-                            'whisper-large-v3-turbo',
-                            'distil-whisper-large-v3',
-                            'SenseVoiceSmall',
-                            'moonshine/base'
-                          ].map((item) => (
-                            <button
-                              type="button"
-                              key={item}
-                              onClick={() => setLocalConfig({ ...localConfig, sttModel: item })}
-                              className={`px-2 py-0.5 rounded text-[10px] font-mono transition-colors border ${
-                                localConfig.sttModel === item
-                                  ? "bg-amber-500/30 text-amber-200 border-amber-400"
-                                  : "bg-slate-900 hover:bg-slate-850 text-slate-300 border-slate-800"
-                              }`}
-                            >
-                              {item}
-                            </button>
-                          ))}
-
-                          {/* Gold Standard High Precision */}
-                          <span className="text-[10px] text-indigo-400/90 font-medium self-center ml-2 mr-1">🎯 High Precision:</span>
-                          {[
-                            'whisper-large-v3',
-                            'whisper-medium',
-                            'whisper-1'
-                          ].map((item) => (
-                            <button
-                              type="button"
-                              key={item}
-                              onClick={() => setLocalConfig({ ...localConfig, sttModel: item })}
-                              className={`px-2 py-0.5 rounded text-[10px] font-mono transition-colors border ${
-                                localConfig.sttModel === item
-                                  ? "bg-indigo-500/30 text-indigo-200 border-indigo-400"
-                                  : "bg-slate-900 hover:bg-slate-850 text-slate-300 border-slate-800"
-                              }`}
-                            >
-                              {item}
-                            </button>
-                          ))}
-
-                          {/* Multimodal Audio-LLMs */}
-                          <span className="text-[10px] text-purple-400/90 font-medium self-center ml-2 mr-1">🎙️ Audio LLM:</span>
-                          {[
-                            'Qwen/Qwen2-Audio-7B-Instruct'
-                          ].map((item) => (
-                            <button
-                              type="button"
-                              key={item}
-                              onClick={() => setLocalConfig({ ...localConfig, sttModel: item })}
-                              className={`px-2 py-0.5 rounded text-[10px] font-mono transition-colors border ${
-                                localConfig.sttModel === item
-                                  ? "bg-purple-500/30 text-purple-200 border-purple-400"
-                                  : "bg-slate-900 hover:bg-slate-850 text-slate-300 border-slate-800"
-                              }`}
-                            >
-                              {item}
-                            </button>
-                          ))}
-                        </div>
+                      <div className="flex flex-col gap-2 pt-1 sm:flex-row sm:flex-wrap">
+                        {error.recovery !== 'file' && (
+                          <Button type="button" onClick={() => handleTranscribe()} className="w-full sm:w-auto">
+                            {partialTranscription ? 'Retry refinement' : 'Retry transcription'}
+                          </Button>
+                        )}
+                        {error.recovery === 'settings' && (
+                          <Button type="button" variant="secondary" onClick={handleReviewSettings} className="w-full sm:w-auto">
+                            Review expert settings
+                          </Button>
+                        )}
+                        {partialTranscription && (
+                          <>
+                            <Button type="button" variant="secondary" onClick={handleUseRecoveredTranscript} className="w-full sm:w-auto">
+                              Open raw transcript
+                            </Button>
+                            <Button type="button" variant="ghost" onClick={() => handleTranscribe(true)} className="w-full sm:w-auto">
+                              Restart from media
+                            </Button>
+                          </>
+                        )}
+                        {error.recovery === 'file' && (
+                          <Button type="button" variant="secondary" onClick={handleReset} className="w-full sm:w-auto">
+                            Choose another file
+                          </Button>
+                        )}
                       </div>
                     </div>
                   </div>
                 )}
 
-                {/* Engine Command Help Snippet */}
-                <div className="p-3 bg-slate-900/90 rounded-xl border border-slate-800 text-[11px] text-slate-400 space-y-2 font-mono">
-                  <div className="text-slate-300 font-sans font-semibold flex items-center justify-between">
-                    <span>⚡ Quick Terminal Launch Snippet ({localConfig.engineType || 'vLLM'} + {localConfig.sttEngine || 'Faster-Whisper'}):</span>
-                  </div>
-                  
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-indigo-300">
-                    {/* LLM Engine Command */}
-                    <div className="bg-slate-950 p-2 rounded border border-slate-800/80 overflow-x-auto space-y-0.5">
-                      <div className="text-[10px] text-slate-400 font-sans font-semibold mb-1">🤖 LLM Server:</div>
-                      {localConfig.engineType === 'vllm' && (
-                        <>
-                          <span className="text-emerald-400">vllm serve google/gemma-4-9b-it --port 8000</span><br/>
-                          <span className="text-slate-500"># or for GPT-OSS:</span><br/>
-                          <span className="text-emerald-400">vllm serve openai/gpt-oss-13b --port 8000</span>
-                        </>
-                      )}
-                      {localConfig.engineType === 'ollama' && (
-                        <>
-                          <span className="text-emerald-400">ollama run gemma4</span><br/>
-                          <span className="text-emerald-400">ollama run gpt-oss</span>
-                        </>
-                      )}
-                      {localConfig.engineType === 'lmstudio' && (
-                        <span>Load Gemma 4 / GPT-OSS in LM Studio & start server on port 1234.</span>
-                      )}
-                      {localConfig.engineType === 'custom' && (
-                        <span>OpenAI-compatible server exposing /v1/chat/completions</span>
-                      )}
-                    </div>
-
-                    {/* STT Engine Command */}
-                    {localConfig.transcriptionMode === TranscriptionMode.LOCAL_STT && (
-                      <div className="bg-slate-950 p-2 rounded border border-slate-800/80 overflow-x-auto space-y-0.5">
-                        <div className="text-[10px] text-slate-400 font-sans font-semibold mb-1">🎙️ STT Engine ({localConfig.sttEngine || 'faster_whisper'}):</div>
-                        {localConfig.sttEngine === 'faster_whisper' && (
-                          <>
-                            <span className="text-emerald-400">faster-whisper-server --port 1234</span><br/>
-                            <span className="text-slate-500"># or whisper.cpp server:</span><br/>
-                            <span className="text-emerald-400">./server -m models/ggml-large-v3-turbo.bin --port 1234</span>
-                          </>
-                        )}
-                        {localConfig.sttEngine === 'vllm_stt' && (
-                          <span className="text-emerald-400">vllm serve whisper-large-v3-turbo --port 8000</span>
-                        )}
-                        {localConfig.sttEngine === 'groq_stt' && (
-                          <span className="text-emerald-400">Endpoint: https://api.groq.com/openai/v1 (Requires Groq API Key)</span>
-                        )}
-                        {localConfig.sttEngine === 'ollama_stt' && (
-                          <span className="text-emerald-400">ollama run whisper</span>
-                        )}
-                        {localConfig.sttEngine === 'custom_stt' && (
-                          <span>Expose /v1/audio/transcriptions on your local endpoint</span>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                </div>
-
-              </div>
-            )}
-
-            {provider === ModelProvider.GEMINI && showSettings && (
-              <div className="mt-4 p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2 text-xs text-slate-400 animate-fadeIn">
-                <p className="font-semibold text-slate-300">Cloud Processing Engine Configuration</p>
-                <p>• Model: <span className="font-mono text-indigo-400">gemini-3.5-flash</span> (supports large audio streams + video files natively)</p>
-                <p>• Max Payload: <span className="text-indigo-400">500MB per file</span>, powered by Gemini File API uploads</p>
-                <p>• Cleanups: Immediate temp file unlinking on Cloud Run, automatic remote deletion after transcription is generated.</p>
-              </div>
-            )}
-          </section>
-
-          {/* Section 1: Upload & Preview */}
-          <section className="grid gap-8 lg:grid-cols-2">
-            
-            {/* Left Col: Uploader */}
-            <div className="space-y-6">
-              <div className="bg-slate-900/50 backdrop-blur-md rounded-2xl border border-slate-800 p-6 shadow-xl">
-                 <div className="flex justify-between items-center mb-4">
-                    <h2 className="text-xl font-semibold text-slate-200">Upload File</h2>
-                    {file && (
-                      <button 
-                        onClick={handleReset}
-                        className="text-xs font-medium text-red-400 hover:text-red-300 transition-colors"
-                      >
-                        Remove
-                      </button>
-                    )}
-                 </div>
-                 
-                 {!file ? (
-                   <FileUploader onFileSelect={handleFileSelect} />
-                 ) : (
-                   <div className="p-6 rounded-xl bg-slate-800/50 border border-slate-700 flex flex-col items-center justify-center space-y-4 animate-fadeIn">
-                      <div className="w-16 h-16 rounded-full bg-indigo-500/20 flex items-center justify-center">
-                        <svg className="w-8 h-8 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3" />
-                        </svg>
-                      </div>
-                      <div className="text-center">
-                        <p className="font-medium text-slate-200 break-all">{file.name}</p>
-                        <p className="text-sm text-slate-500 mt-1">
-                          {(file.size / (1024 * 1024)).toFixed(2)} MB
-                        </p>
-                      </div>
-                      
-                      {objectUrl && (
-                        file.name.toLowerCase().endsWith('.mp4') || file.name.toLowerCase().endsWith('.mov') || file.type.startsWith('video/mp4') || file.type.startsWith('video/quicktime') ? (
-                          <video 
-                            controls 
-                            src={objectUrl} 
-                            className="w-full mt-4 rounded-lg bg-slate-950 border border-slate-700 max-h-48"
-                          />
-                        ) : (
-                          <audio 
-                            controls 
-                            src={objectUrl} 
-                            className="w-full mt-4 h-10 rounded-lg"
-                          />
-                        )
-                      )}
-                   </div>
-                 )}
-
-                 {file && status !== AppStatus.PROCESSING && status !== AppStatus.COMPLETED && (
-                   <div className="mt-6">
-                     <Button 
-                        onClick={handleTranscribe} 
-                        className="w-full py-3 text-lg"
-                        isLoading={status === AppStatus.PROCESSING}
-                      >
-                        Start Transcription
+                {status === AppStatus.CANCELLED && (
+                  <div className="mt-5 rounded-xl border border-slate-600 bg-slate-800/50 p-4" aria-labelledby="canceled-title">
+                    <h3 id="canceled-title" className="font-semibold text-slate-100">Transcription canceled</h3>
+                    <p className="mt-1 text-sm leading-relaxed text-slate-300">
+                      Your media file, route settings, speech hints, and any saved raw transcript are unchanged.
+                    </p>
+                    <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:flex-wrap">
+                      <Button id="retry-canceled-button" type="button" onClick={() => handleTranscribe()} className="w-full sm:w-auto">
+                        {partialTranscription ? 'Retry refinement' : 'Retry transcription'}
                       </Button>
-                   </div>
-                 )}
-                 
-                 {status === AppStatus.PROCESSING && (
-                    <div className="mt-6 flex flex-col items-center space-y-3 p-4 bg-indigo-900/10 rounded-xl border border-indigo-500/20">
-                      <div className="w-full max-w-xs bg-slate-700 h-1.5 rounded-full overflow-hidden">
-									{uploadProgress !== null && uploadProgress < 100 ? (
-										<div 
-											className="h-full bg-indigo-500 transition-all duration-300 ease-out"
-											style={{ width: `${uploadProgress}%` }}
-										/>
-									) : (
-										<div className="h-full bg-indigo-500 animate-progress"></div>
-									)}
-								</div>
-								<p className="text-sm text-indigo-300 text-center animate-pulse">
-									{processingStatus || "Analyzing audio & generating text..."}
-								</p>
+                      {partialTranscription && (
+                        <Button type="button" variant="secondary" onClick={handleUseRecoveredTranscript} className="w-full sm:w-auto">
+                          Open raw transcript
+                        </Button>
+                      )}
+                      <Button type="button" variant="ghost" onClick={handleReset} className="w-full sm:w-auto">Choose another file</Button>
                     </div>
-                 )}
-
-                 {error && (
-                    <div className="mt-6 p-4 rounded-xl bg-red-900/20 border border-red-500/30 text-red-200 text-sm flex items-start gap-3">
-                       <svg className="w-5 h-5 text-red-400 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                       </svg>
-                       {error}
-                    </div>
-                 )}
-              </div>
-              {/* Custom Terms Card */}
-              <div className="bg-slate-900/50 backdrop-blur-md rounded-2xl border border-slate-800 p-6 shadow-xl space-y-4">
-                <div className="flex justify-between items-center">
-                  <div>
-                    <h2 className="text-lg font-semibold text-slate-200 flex items-center gap-2">
-                      <svg className="w-5 h-5 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                      </svg>
-                      Speech Hints & Custom Terms
-                    </h2>
-                    <p className="text-xs text-slate-400 mt-1">
-                      Upload a text file with terms (one per line) to correct phonetic spelling.
-                    </p>
                   </div>
-                  {termsList.length > 0 && (
-                    <button
-                      type="button"
-                      onClick={handleClearTerms}
-                      className="text-xs font-medium text-red-400 hover:text-red-300 transition-colors cursor-pointer"
-                    >
-                      Clear
-                    </button>
-                  )}
-                </div>
+                )}
+              </section>
+            </li>
 
-                <div
-                  onDragOver={(e) => { e.preventDefault(); setIsDraggingTerms(true); }}
-                  onDragLeave={() => setIsDraggingTerms(false)}
-                  onDrop={handleTermsFileDrop}
-                  className={`
-                    relative rounded-xl border border-dashed p-4 text-center transition-all duration-200 cursor-pointer
-                    ${isDraggingTerms 
-                      ? 'border-indigo-400 bg-indigo-500/10 scale-[1.01]' 
-                      : 'border-slate-700 hover:border-indigo-500 bg-slate-950/20 hover:bg-slate-950/40'
-                    }
-                  `}
-                  onClick={() => document.getElementById('terms-file-input')?.click()}
-                >
-                  <input
-                    id="terms-file-input"
-                    type="file"
-                    accept=".txt,text/plain"
-                    onChange={handleTermsFileSelect}
-                    className="hidden"
+            <li>
+              <section aria-labelledby="transcript-stage-title">
+                <WorkflowStageHeader
+                  number={3}
+                  id="transcript-stage-title"
+                  title="Transcript"
+                  description="Review, edit, and export the completed transcript here."
+                  state={hasCompletedTranscript ? 'current' : 'upcoming'}
+                />
+
+                {hasCompletedTranscript ? (
+                  <TranscriptionDisplay
+                    text={transcription}
+                    originalText={generatedTranscription}
+                    title={transcriptTitle}
+                    notes={transcriptNotes}
+                    metadata={completionMetadata!}
+                    onTextChange={setTranscription}
+                    onTitleChange={setTranscriptTitle}
+                    onNotesChange={setTranscriptNotes}
+                    onTranscribeAnother={handleReset}
+                    headingLevel="h3"
                   />
-                  
-                  <div className="flex flex-col items-center justify-center space-y-1.5 pointer-events-none">
-                    <svg className="w-6 h-6 text-indigo-400/80" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
-                    </svg>
-                    <p className="text-xs font-medium text-slate-300">
-                      {termsFileName ? `File: ${termsFileName}` : "Upload terms list (.txt)"}
-                    </p>
-                    <p className="text-[10px] text-slate-500">
-                      Drag & drop or click to select text file
-                    </p>
+                ) : (
+                  <div className="flex min-h-52 w-full flex-col items-center justify-center rounded-2xl border border-dashed border-slate-700 bg-slate-900/30 p-5 text-slate-300 sm:min-h-60 sm:p-8">
+                    <SignalToTextMark className="mb-3 h-14 w-56 max-w-full opacity-55" />
+                    <h3 className="font-editorial text-xl font-semibold leading-tight text-slate-100">{emptyTranscriptState.title}</h3>
+                    <p className="mt-1 max-w-sm text-center text-sm leading-6 text-slate-400">{emptyTranscriptState.body}</p>
                   </div>
-                </div>
-
-                {/* Inline Editing Textarea */}
-                <div className="space-y-1.5">
-                  <div className="flex justify-between items-center text-xs font-medium text-slate-400 uppercase tracking-wider">
-                    <span>Inline Terms List</span>
-                    {termsList.length > 0 && (
-                      <span className="text-indigo-400 normal-case font-mono bg-indigo-500/10 px-1.5 py-0.5 rounded border border-indigo-500/20 flex items-center gap-1 text-[10px]">
-                        <span className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-pulse" />
-                        {termsList.length} term{termsList.length === 1 ? '' : 's'} active
-                      </span>
-                    )}
-                  </div>
-                  <textarea
-                    rows={4}
-                    value={termsText}
-                    onChange={handleTermsTextChange}
-                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono placeholder:text-slate-600 resize-none leading-relaxed"
-                    placeholder={`Type terms manually or split them by lines, e.g.:
-DenisSvgn
-Google Gemini
-DeepMind
-Ollama`}
-                  />
-                </div>
-              </div>
-            </div>
-
-            {/* Right Col: Results */}
-            <div className="h-full min-h-[400px]">
-               {transcription ? (
-                 <TranscriptionDisplay text={transcription} />
-               ) : (
-                 <div className="h-full w-full rounded-2xl border border-slate-800 bg-slate-900/30 flex flex-col items-center justify-center text-slate-500 p-8 border-dashed">
-                   <div className="w-16 h-16 rounded-full bg-slate-800/50 mb-4 flex items-center justify-center">
-                     <svg className="w-8 h-8 opacity-50" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
-                     </svg>
-                   </div>
-                   <p className="text-lg font-medium">No transcription yet</p>
-                   <p className="text-sm opacity-60">Upload a file to see the results here</p>
-                 </div>
-               )}
-            </div>
-
-          </section>
+                )}
+              </section>
+            </li>
+          </ol>
         </main>
       </div>
 
@@ -1098,6 +1318,19 @@ Ollama`}
         }
         .animate-progress {
           animation: progress 8s ease-out forwards;
+        }
+        @media (prefers-reduced-motion: reduce) {
+          *, *::before, *::after {
+            scroll-behavior: auto !important;
+            transition-duration: 0s !important;
+            transition-delay: 0s !important;
+          }
+          .animate-progress,
+          .animate-pulse,
+          .animate-spin,
+          .animate-fadeIn {
+            animation: none !important;
+          }
         }
       `}</style>
     </div>
