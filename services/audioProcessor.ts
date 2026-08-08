@@ -10,8 +10,10 @@
  */
 export async function downsampleAudio(
   arrayBuffer: ArrayBuffer,
-  targetSampleRate: number
+  targetSampleRate: number,
+  signal?: AbortSignal
 ): Promise<AudioBuffer> {
+  if (signal?.aborted) throw new DOMException('The operation was canceled.', 'AbortError');
   const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
   if (!AudioContextClass) {
     throw new Error("Web Audio API is not supported in this browser.");
@@ -47,6 +49,7 @@ export async function downsampleAudio(
       console.error("Failed to close temp AudioContext:", e);
     }
   }
+  if (signal?.aborted) throw new DOMException('The operation was canceled.', 'AbortError');
 
   // Use OfflineAudioContext for extremely fast offline rendering
   const OfflineContextClass = window.OfflineAudioContext || (window as any).webkitOfflineAudioContext;
@@ -68,7 +71,9 @@ export async function downsampleAudio(
   sourceNode.start(0);
 
   // Perform parallel audio rendering
-  return await offlineCtx.startRendering();
+  const rendered = await offlineCtx.startRendering();
+  if (signal?.aborted) throw new DOMException('The operation was canceled.', 'AbortError');
+  return rendered;
 }
 
 /**
@@ -139,8 +144,10 @@ function writeString(view: DataView, offset: number, string: string) {
  */
 export async function optimizeMediaFile(
   file: File,
-  onProgress: (status: string) => void
+  onProgress: (status: string) => void,
+  signal?: AbortSignal
 ): Promise<File> {
+  if (signal?.aborted) throw new DOMException('The operation was canceled.', 'AbortError');
   const MAX_SAFE_SIZE = 25 * 1024 * 1024; // 25 MB safety limit
   
   // If the file is small and not a video, keep it untouched to avoid redundant decoding processing
@@ -164,11 +171,12 @@ export async function optimizeMediaFile(
     console.log(`Optimizing file: ${file.name} (${(file.size / (1024*1024)).toFixed(2)} MB)`);
     
     const arrayBuffer = await file.arrayBuffer();
+    if (signal?.aborted) throw new DOMException('The operation was canceled.', 'AbortError');
     
     // 12000Hz mono WAV is ~1.4MB of raw audio data per minute, easily supporting large records well under 32MB
     const targetSampleRate = 12000; 
     
-    const optimizedBuffer = await downsampleAudio(arrayBuffer, targetSampleRate);
+    const optimizedBuffer = await downsampleAudio(arrayBuffer, targetSampleRate, signal);
     onProgress("Writing optimized WAV stream...");
     
     const wavBlob = audioBufferToWav(optimizedBuffer);
@@ -188,6 +196,7 @@ export async function optimizeMediaFile(
     
     return optimizedFile;
   } catch (error: any) {
+    if (signal?.aborted || error?.name === 'AbortError') throw new DOMException('The operation was canceled.', 'AbortError');
     console.warn("Client-side downsample failed, proceeding with original file:", error);
     onProgress("Local extraction failed, executing default cloud raw transmission...");
     return file;
