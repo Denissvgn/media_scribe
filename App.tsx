@@ -202,20 +202,38 @@ const App: React.FC = () => {
   });
 
   const [localConfig, setLocalConfig] = useState<LocalConfig>(() => {
+    let sessionKeys: { apiKey?: string; sttApiKey?: string } = {};
+    try {
+      const storedSession = sessionStorage.getItem('media_scribe_session_keys');
+      if (storedSession) {
+        sessionKeys = JSON.parse(storedSession);
+      }
+    } catch (_) {}
+
     const saved = localStorage.getItem('local_config');
     if (saved) {
       try {
         const parsed = JSON.parse(saved);
+        // Clean legacy plain-text API keys from persistent localStorage if present
+        if (parsed.apiKey || parsed.sttApiKey) {
+          if (!sessionKeys.apiKey && parsed.apiKey) sessionKeys.apiKey = parsed.apiKey;
+          if (!sessionKeys.sttApiKey && parsed.sttApiKey) sessionKeys.sttApiKey = parsed.sttApiKey;
+          const sanitized = { ...parsed };
+          delete sanitized.apiKey;
+          delete sanitized.sttApiKey;
+          localStorage.setItem('local_config', JSON.stringify(sanitized));
+        }
+
         return {
           baseUrl: parsed.baseUrl || 'http://localhost:8000/v1',
           llmModel: parsed.llmModel || 'gemma4',
           transcriptionMode: parsed.transcriptionMode || TranscriptionMode.LOCAL_STT,
           sttUrl: parsed.sttUrl || 'http://localhost:1234/v1',
           sttModel: parsed.sttModel || 'whisper-large-v3-turbo',
-          apiKey: parsed.apiKey || '',
+          apiKey: sessionKeys.apiKey || '',
           engineType: parsed.engineType || 'vllm',
           sttEngine: parsed.sttEngine || 'faster_whisper',
-          sttApiKey: parsed.sttApiKey || '',
+          sttApiKey: sessionKeys.sttApiKey || '',
           sttLanguage: parsed.sttLanguage || 'auto'
         };
       } catch (e) {}
@@ -226,10 +244,10 @@ const App: React.FC = () => {
       transcriptionMode: TranscriptionMode.LOCAL_STT,
       sttUrl: 'http://localhost:1234/v1',
       sttModel: 'whisper-large-v3-turbo',
-      apiKey: '',
+      apiKey: sessionKeys.apiKey || '',
       engineType: 'vllm',
       sttEngine: 'faster_whisper',
-      sttApiKey: '',
+      sttApiKey: sessionKeys.sttApiKey || '',
       sttLanguage: 'auto'
     };
   });
@@ -364,13 +382,23 @@ const App: React.FC = () => {
   const [showSettings, setShowSettings] = useState(false);
   const [openExpertSection, setOpenExpertSection] = useState<ExpertSectionId | null>(null);
 
-  // Sync settings to localStorage
+  // Sync settings: persist non-sensitive config to localStorage, scope credentials to sessionStorage
   useEffect(() => {
     localStorage.setItem('model_provider', provider);
   }, [provider]);
 
   useEffect(() => {
-    localStorage.setItem('local_config', JSON.stringify(localConfig));
+    const { apiKey, sttApiKey, ...persistentConfig } = localConfig;
+    localStorage.setItem('local_config', JSON.stringify(persistentConfig));
+
+    if (apiKey?.trim() || sttApiKey?.trim()) {
+      sessionStorage.setItem('media_scribe_session_keys', JSON.stringify({
+        apiKey: apiKey || '',
+        sttApiKey: sttApiKey || ''
+      }));
+    } else {
+      sessionStorage.removeItem('media_scribe_session_keys');
+    }
   }, [localConfig]);
 
   const focusSettingsTarget = (targetId: string) => {
