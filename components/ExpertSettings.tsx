@@ -425,7 +425,7 @@ export const ExpertSettings: React.FC<ExpertSettingsProps> = ({
                     className={monoInputClassName}
                     placeholder="Optional API key"
                   />
-                  <p className="mt-1 text-xs leading-5 text-slate-400">Sent as a Bearer token when provided.</p>
+                  <p className="mt-1 text-xs leading-5 text-slate-400">Sent as a Bearer token when provided. Kept in browser session memory only.</p>
                 </div>
                 {localSpeechEnabled && (
                   <>
@@ -454,7 +454,7 @@ export const ExpertSettings: React.FC<ExpertSettingsProps> = ({
                         className={monoInputClassName}
                         placeholder="Optional API key"
                       />
-                      <p className="mt-1 text-xs leading-5 text-slate-400">Required by hosted services such as Groq.</p>
+                      <p className="mt-1 text-xs leading-5 text-slate-400">Required by hosted services such as Groq. Kept in browser session memory only.</p>
                     </div>
                   </>
                 )}
